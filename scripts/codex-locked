@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Optional cooperating lock for SSH/tmux sessions. Run as the bot's Unix account.
+set -euo pipefail
+
+if (( $# < 1 )); then
+    printf 'Usage: codex-locked REPOSITORY [codex arguments...]\n' >&2
+    exit 2
+fi
+repo_name=$1
+shift
+if [[ ! $repo_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]]; then
+    printf 'Invalid repository name\n' >&2
+    exit 2
+fi
+: "${CODEX_BIN:?Set CODEX_BIN to the absolute Codex executable}"
+: "${CODEX_HOME:?Set CODEX_HOME to the bot account Codex directory}"
+repo_root=${REPOS_ROOT:-/repos}
+bot_state=${STATE_DIR:-/var/lib/codex-discord-bot}
+repo_path=$repo_root/$repo_name
+if [[ $repo_root != /* || $(realpath -e -- "$repo_path") != "$repo_path" || ! -d $repo_path/.git || -L $repo_path/.git ]]; then
+    printf 'Repository must be a real Git directory directly under REPOS_ROOT\n' >&2
+    exit 2
+fi
+if [[ ! -d $bot_state/locks ]]; then
+    printf 'Start the configured bot once to create its private lock directory\n' >&2
+    exit 2
+fi
+cd -- "$repo_path"
+export CODEX_HOME
+exec flock --nonblock --conflict-exit-code 75 "$bot_state/locks/$repo_name.lock" "$CODEX_BIN" "$@"

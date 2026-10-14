@@ -1,0 +1,31 @@
+[Unit]
+Description=Personal Discord Codex Agent Manager
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=codexbot
+Group=codexbot
+EnvironmentFile=/etc/codex-discord-bot.env
+Environment=HOME=/home/codexbot
+WorkingDirectory=/var/lib/codex-discord-bot
+StateDirectory=codex-discord-bot
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/codex-discord-bot run
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=20
+SendSIGKILL=yes
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
