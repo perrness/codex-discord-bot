@@ -228,6 +228,8 @@ impl Store {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("UPDATE issue_runs SET session_id=$2,updated_at=now() WHERE 'issue:' || id::text = $1 AND state='preparing'")
+            .bind(source).bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
         self.session(id).await
     }

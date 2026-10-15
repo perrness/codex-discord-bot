@@ -152,11 +152,12 @@ impl Manager {
         } else {
             sqlx::query("UPDATE sessions SET discord_channel_id=NULL,status_message_id=NULL,last_seen_message_id=NULL,channel_state='provisioning',completed_at=NULL,delete_after=NULL,discord_retry_at=now() WHERE id=$1")
             .bind(id).execute(&self.store.pool).await?;
-            let repo: Repository =
-                sqlx::query_as("SELECT id,name,path FROM repositories WHERE id=$1")
-                    .bind(session.repository_id)
-                    .fetch_one(&self.store.pool)
-                    .await?;
+            let repo: Repository = sqlx::query_as(
+                "SELECT id,name,path,github_repository FROM repositories WHERE id=$1",
+            )
+            .bind(session.repository_id)
+            .fetch_one(&self.store.pool)
+            .await?;
             self.provision_channel(&self.store.session(id).await?, &repo.name)
                 .await?
         };

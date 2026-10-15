@@ -39,10 +39,11 @@ impl Manager {
             tx.commit().await?;
             return Ok(());
         };
-        let repo: Repository = sqlx::query_as("SELECT id,name,path FROM repositories WHERE id=$1")
-            .bind(session.repository_id)
-            .fetch_one(&self.store.pool)
-            .await?;
+        let repo: Repository =
+            sqlx::query_as("SELECT id,name,path,github_repository FROM repositories WHERE id=$1")
+                .bind(session.repository_id)
+                .fetch_one(&self.store.pool)
+                .await?;
         ensure!(
             self.root.validate(&repo.name).await?.to_str()
                 == Some(session.working_directory.as_str()),

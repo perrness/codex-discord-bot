@@ -1832,3 +1832,146 @@ async fn github_mapping_persists_and_failed_discovery_starts_no_task() -> Result
     );
     f.cleanup().await
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn issue_queue_serializes_claims_and_requires_explicit_retry_after_restart() -> Result<()> {
+    use codex_discord_bot::queue::State;
+    let f = Fixture::new().await?;
+    f.manager.register_repository("queue", true).await?;
+    let store = &f.manager.store;
+    let repo = store.repository("queue").await?;
+    sqlx::query(
+        "INSERT INTO issue_queues(repository_id,requester_id,guild_id) VALUES($1,'42','7')",
+    )
+    .bind(repo.id)
+    .execute(&store.pool)
+    .await?;
+    for n in [1, 1, 2] {
+        store.enqueue_issue(repo.id, "owner/repo", n).await?;
+    }
+    assert!(store.claim_issue(repo.id).await?.is_none());
+    sqlx::query("UPDATE issue_queues SET paused=false WHERE repository_id=$1")
+        .bind(repo.id)
+        .execute(&store.pool)
+        .await?;
+    let (a, b) = tokio::join!(store.claim_issue(repo.id), store.claim_issue(repo.id));
+    let (a, b) = (a?, b?);
+    assert_ne!(a.is_some(), b.is_some());
+    let run = a.or(b).unwrap();
+    assert_eq!(run.issue_number, 1);
+    let mut stale = codex_discord_bot::queue::Run {
+        id: run.id,
+        repository_id: run.repository_id,
+        github_repository: run.github_repository.clone(),
+        issue_number: run.issue_number,
+        attempt: run.attempt,
+        state: run.state.clone(),
+        session_id: run.session_id,
+        claim_id: Some(Uuid::new_v4()),
+    };
+    assert!(
+        store
+            .transition_issue(&stale, State::Preparing, State::Implementing, None)
+            .await
+            .is_err()
+    );
+    stale.claim_id = run.claim_id;
+    store
+        .transition_issue(&stale, State::Preparing, State::Implementing, None)
+        .await?;
+    assert!(
+        store
+            .transition_issue(&stale, State::Preparing, State::Implementing, None)
+            .await
+            .is_err()
+    );
+    store.reconcile_issues().await?;
+    store.reconcile_issues().await?;
+    assert!(store.claim_issue(repo.id).await?.is_none());
+    store.retry_issue(repo.id, 1).await?;
+    sqlx::query("UPDATE issue_queues SET paused=true WHERE repository_id=$1")
+        .bind(repo.id)
+        .execute(&store.pool)
+        .await?;
+    assert!(store.claim_issue(repo.id).await?.is_none());
+    sqlx::query("UPDATE issue_queues SET paused=false WHERE repository_id=$1")
+        .bind(repo.id)
+        .execute(&store.pool)
+        .await?;
+    let next = store.claim_issue(repo.id).await?.unwrap();
+    assert_eq!(next.issue_number, 2);
+    store
+        .transition_issue(&next, State::Preparing, State::Failed, Some("setup failed"))
+        .await?;
+    let retry = store.claim_issue(repo.id).await?.unwrap();
+    assert_eq!((retry.issue_number, retry.attempt), (1, 2));
+    assert!(store.retry_issue(repo.id, 1).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM issue_runs WHERE repository_id=$1")
+        .bind(repo.id)
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(count, 3);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn issue_dispatch_links_existing_task_channels_and_never_replays_on_restart() -> Result<()> {
+    use codex_discord_bot::queue::State;
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("issues", true).await?;
+    let store = &f.manager.store;
+    let repo = store.repository("issues").await?;
+    sqlx::query("INSERT INTO issue_queues(repository_id,requester_id,guild_id,paused) VALUES($1,'42','7',false)")
+        .bind(repo.id).execute(&store.pool).await?;
+    store.enqueue_issue(repo.id, "owner/repo", 3).await?;
+    let run = store.claim_issue(repo.id).await?.unwrap();
+    f.manager
+        .queue_command("pause", "issues", 42, 7, None)
+        .await?;
+    let source = format!("issue:{}", run.id);
+    f.manager
+        .create_task(42, 7, &source, "issues", "Implement issue #3")
+        .await?;
+    store
+        .transition_issue(&run, State::Preparing, State::Implementing, None)
+        .await?;
+    let (thread, channel): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT codex_thread_id,discord_channel_id FROM issue_execution WHERE id=$1",
+    )
+    .bind(run.id)
+    .fetch_one(&store.pool)
+    .await?;
+    assert!(thread.is_some() && channel.is_some());
+    assert!(
+        f.manager
+            .create_task(42, 7, &source, "issues", "Duplicate")
+            .await
+            .is_err()
+    );
+    f.manager.recover().await?;
+    store.reconcile_issues().await?;
+    f.manager
+        .queue_command("resume", "issues", 42, 7, None)
+        .await?;
+    assert!(store.claim_issue(repo.id).await?.is_none());
+    assert!(store.retry_issue(repo.id, 3).await.is_err());
+    let status = f
+        .manager
+        .queue_command("status", "issues", 42, 7, None)
+        .await?;
+    assert!(status.contains("blocked"));
+    let turns = f
+        .mock
+        .observed
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|v| v["method"] == "turn/start")
+        .count();
+    assert_eq!(turns, 1);
+    f.cleanup().await
+}

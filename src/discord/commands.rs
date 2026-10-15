@@ -45,23 +45,8 @@ pub fn definitions() -> Vec<CreateCommand> {
                 "List registered repositories",
             )),
         CreateCommand::new("queue")
-            .description("Read the GitHub Issues backlog")
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "list",
-                    "List unclaimed codex-ready issues",
-                )
-                .add_sub_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "repo",
-                        "Registered repository",
-                    )
-                    .required(true)
-                    .set_autocomplete(true),
-                ),
-            ),
+            .description("Manage the durable GitHub Issues queue")
+            .set_options(queue_options()),
         CreateCommand::new("project")
             .description("Create a new Git project")
             .add_option(
@@ -127,8 +112,17 @@ pub async fn execute(manager: &Manager, c: &CommandInteraction) -> Result<String
             let ResolvedValue::SubCommand(fields) = &sub.value else {
                 bail!("Invalid subcommand");
             };
-            anyhow::ensure!(sub.name == "list", "Unknown subcommand");
-            manager.list_queue(string(fields, "repo")?).await
+            let name = string(fields, "repo")?;
+            if sub.name == "list" {
+                return manager.list_queue(name).await;
+            }
+            let issue = fields.iter().find_map(|o| match o.value {
+                ResolvedValue::Integer(n) if o.name == "issue" => Some(n),
+                _ => None,
+            });
+            manager
+                .queue_command(sub.name, name, c.user.id.get(), guild, issue)
+                .await
         }
         "repo" | "project" => {
             let sub = options.first().context("Missing subcommand")?;
@@ -344,4 +338,38 @@ fn string<'a>(options: &'a [ResolvedOption<'a>], name: &str) -> Result<&'a str> 
             }
         })
         .context("Missing command argument")
+}
+
+fn queue_options() -> Vec<CreateCommandOption> {
+    ["list", "start", "pause", "resume", "status", "retry"]
+        .into_iter()
+        .map(|action| {
+            let mut option = CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                action,
+                format!("{action} repository issue queue"),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "repo",
+                    "Registered repository",
+                )
+                .required(true)
+                .set_autocomplete(true),
+            );
+            if action == "retry" {
+                option = option.add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Integer,
+                        "issue",
+                        "Issue number to retry after review",
+                    )
+                    .required(true)
+                    .min_int_value(1),
+                );
+            }
+            option
+        })
+        .collect()
 }

@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         server.shutdown().await;
         return Err(error.context("Session recovery failed"));
     }
+    manager.store.reconcile_issues().await?;
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
     let mut discord = Client::builder(&config.discord_token, intents)
@@ -80,6 +81,7 @@ async fn main() -> Result<()> {
     let mut dispatch = tokio::spawn(manager.clone().dispatch(events));
     let mut delivery = tokio::spawn(manager.clone().deliver());
     let mut maintenance = tokio::spawn(manager.clone().maintain());
+    let mut issue_queue = tokio::spawn(manager.clone().run_issue_queue());
     let mut channels = tokio::spawn(manager.clone().maintain_channels());
     let mut gateway = tokio::spawn(async move { discord.start().await });
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
         _ = &mut dispatch => { tracing::error!("Codex event dispatch stopped"); false },
         _ = &mut delivery => { tracing::error!("Discord outbox worker stopped; check database connectivity"); false },
         _ = &mut maintenance => { tracing::error!("Database/request maintenance stopped"); false },
+        _ = &mut issue_queue => { tracing::error!("Issue queue stopped"); false },
         _ = &mut channels => { tracing::error!("Discord channel maintenance stopped"); false },
         _ = &mut gateway => { tracing::error!("Discord gateway stopped"); false },
         _ = async {
@@ -112,6 +115,7 @@ async fn main() -> Result<()> {
     delivery.abort();
     maintenance.abort();
     channels.abort();
+    issue_queue.abort();
     gateway.abort();
     // Claims stay durable until next startup has reconciled history and process cleanup.
     tracing::info!(
