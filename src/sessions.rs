@@ -186,17 +186,24 @@ impl Manager {
                 guild,
                 self.control_channel.load(Ordering::Relaxed),
                 source,
+                Some(&render::truncate(task, 500)),
             )
             .await?;
         let gate = self.gate(session.id);
         let _guard = gate.lock().await;
         let result = async {
             self.take_repository_lock(&repo, session.id)?;
-            sqlx::query("UPDATE sessions SET channel_kind='text',channel_state='provisioning',task_title=$2 WHERE id=$1")
-                .bind(session.id).bind(render::truncate(task, 500)).execute(&self.store.pool).await?;
             let session = self.store.session(session.id).await?;
             let channel = self.provision_channel(&session, name).await?;
-            self.sync_status(&self.store.session(session.id).await?).await?;
+            let current = self.store.session(session.id).await?;
+            if let Err(error) = self.sync_status(&current).await {
+                self.channel_failure(&current, &error).await?;
+                let diagnostic = self.discord_diagnostic(&error);
+                return Err(error.context(format!(
+                    "{diagnostic}. Use /reconnect session:{}",
+                    session.id
+                )));
+            }
             let codex = self
                 .client
                 .start_thread(
@@ -336,24 +343,22 @@ impl Manager {
 
     async fn followup_locked(&self, session: &Session, source: &str, text: &str) -> Result<()> {
         if session.terminal_task() {
-            // An authorized follow-up cancels retention even if resuming is blocked by another
-            // repository owner or an unavailable Codex history.
+            // An authorized follow-up cancels retention or restores a dismissed legacy thread
+            // to the list even if another repository owner or unavailable history blocks resuming.
             let mut tx = self.store.pool.begin().await?;
-            sqlx::query("UPDATE sessions SET channel_state='active',completed_at=NULL,delete_after=NULL WHERE id=$1")
+            sqlx::query("UPDATE sessions SET channel_state=CASE WHEN channel_kind='thread' THEN 'legacy' ELSE 'active' END,completed_at=NULL,delete_after=NULL WHERE id=$1")
                 .bind(session.id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM discord_outbox WHERE session_id=$1 AND delivered_at IS NULL AND (dedupe_key LIKE 'task-completed:%' OR dedupe_key LIKE 'task-dismissed:%')")
                 .bind(session.id).execute(&mut *tx).await?;
             tx.commit().await?;
         }
-        let thread = session
-            .codex_thread_id
-            .as_deref()
-            .context("Session setup did not complete; start a new /codex task")?;
+        let thread = session.codex_thread_id.as_deref();
         match session.status.as_str() {
             "waiting" => {
                 bail!("Use the question or approval controls above, or /stop to cancel the turn")
             }
             "running" => {
+                let thread = thread.context("Running session has no Codex conversation")?;
                 let turn = session
                     .current_turn_id
                     .as_deref()
@@ -415,20 +420,46 @@ impl Manager {
                     .await?;
                     return Err(error);
                 }
-                if self
-                    .client
-                    .resume_thread(
-                        thread,
-                        &session.working_directory,
-                        self.config.approvals_reviewer,
-                    )
-                    .await
-                    .is_err()
-                {
-                    self.fail_closed("resume could not be verified");
-                    bail!("Could not safely resume the conversation; recovery is required");
+                if let Some(thread) = thread {
+                    if self
+                        .client
+                        .resume_thread(
+                            thread,
+                            &session.working_directory,
+                            self.config.approvals_reviewer,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        self.fail_closed("resume could not be verified");
+                        bail!("Could not safely resume the conversation; recovery is required");
+                    }
+                } else {
+                    let codex = match self
+                        .client
+                        .start_thread(
+                            &session.working_directory,
+                            self.config.model.as_deref(),
+                            self.config.approvals_reviewer,
+                        )
+                        .await
+                    {
+                        Ok(codex) => codex,
+                        Err(error) => {
+                            sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,last_error='Conversation setup failed; no task was submitted' WHERE id=$1")
+                                .bind(session.id).execute(&self.store.pool).await?;
+                            self.drop_repository_lock(session);
+                            return Err(error);
+                        }
+                    };
+                    sqlx::query("UPDATE sessions SET codex_thread_id=$2 WHERE id=$1")
+                        .bind(session.id)
+                        .bind(codex.thread.id)
+                        .execute(&self.store.pool)
+                        .await?;
                 }
-                self.submit_turn(session, source, text).await?;
+                self.submit_turn(&self.store.session(session.id).await?, source, text)
+                    .await?;
             }
             _ => bail!(
                 "Session is {}. Check /status before sending another task.",

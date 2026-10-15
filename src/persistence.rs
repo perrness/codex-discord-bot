@@ -178,7 +178,7 @@ impl Store {
     }
     pub async fn sessions(&self, limit: i64) -> Result<Vec<Session>> {
         Ok(sqlx::query_as(
-            "SELECT * FROM sessions ORDER BY repository_claimed DESC, updated_at DESC LIMIT $1",
+            "SELECT * FROM sessions WHERE NOT (channel_state='dismissed' AND (channel_kind='thread' OR COALESCE(discord_channel_id,discord_thread_id) IS NULL)) ORDER BY repository_claimed DESC, updated_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -203,11 +203,15 @@ impl Store {
         guild: u64,
         parent: u64,
         source: &str,
+        task_title: Option<&str>,
     ) -> Result<Session> {
         let id = Uuid::new_v4();
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("INSERT INTO sessions(id,repository_id,requester_id,guild_id,parent_channel_id,working_directory,status) VALUES($1,$2,$3,$4,$5,$6,'provisioning')")
-            .bind(id).bind(repo.id).bind(requester.to_string()).bind(guild.to_string()).bind(parent.to_string()).bind(&repo.path).execute(&mut *tx).await;
+        let result = sqlx::query("INSERT INTO sessions(id,repository_id,requester_id,guild_id,parent_channel_id,working_directory,status,channel_kind,channel_state,task_title) VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,$8,$9)")
+            .bind(id).bind(repo.id).bind(requester.to_string()).bind(guild.to_string()).bind(parent.to_string()).bind(&repo.path)
+            .bind(if task_title.is_some() { "text" } else { "thread" })
+            .bind(if task_title.is_some() { "provisioning" } else { "legacy" })
+            .bind(task_title.unwrap_or_default()).execute(&mut *tx).await;
         if let Err(e) = result {
             if e.as_database_error()
                 .is_some_and(|e| e.is_unique_violation())

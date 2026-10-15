@@ -1,9 +1,12 @@
-use super::render;
+use super::{
+    errors::{self, Operation},
+    render,
+};
 use crate::{persistence::Session, sessions::Manager};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
-use serenity::{all::*, http::HttpError};
+use serenity::all::*;
 use std::{
     collections::HashSet,
     sync::{Arc, atomic::Ordering},
@@ -16,6 +19,19 @@ fn marker(id: Uuid) -> String {
 }
 fn status_marker(id: Uuid) -> String {
     format!("Session: {id}")
+}
+
+fn ensure_category_permissions(channel: &GuildChannel, category: &GuildChannel) -> Result<()> {
+    ensure!(
+        channel.parent_id == Some(category.id)
+            && channel.permission_overwrites.len() == category.permission_overwrites.len()
+            && category
+                .permission_overwrites
+                .iter()
+                .all(|p| channel.permission_overwrites.contains(p)),
+        "Created channel did not retain the active category's permissions; inspect it before using this task"
+    );
+    Ok(())
 }
 
 /// ASCII slugs avoid Discord's Unicode normalization changing collision checks.
@@ -87,6 +103,8 @@ pub(crate) fn reported_plan(value: &Value) -> Value {
 fn status_text(s: &Session, repo: &str) -> String {
     let state = if s.terminal_task() {
         s.channel_state.as_str()
+    } else if s.status == "idle" && s.codex_thread_id.is_none() {
+        "Setup recovered; send a new task message to begin"
     } else if s.status == "idle" {
         match s.last_outcome.as_deref() {
             Some("failed") => "Failed — needs attention",
@@ -144,12 +162,7 @@ fn status_text(s: &Session, repo: &str) -> String {
 }
 
 pub(crate) fn discord_error_code(error: &anyhow::Error) -> Option<isize> {
-    match error.downcast_ref::<serenity::Error>()? {
-        serenity::Error::Http(HttpError::UnsuccessfulRequest(response)) => {
-            Some(response.error.code)
-        }
-        _ => None,
-    }
+    errors::code(error)
 }
 
 pub(crate) fn retry_seconds(attempts: i32) -> i32 {
@@ -158,14 +171,24 @@ pub(crate) fn retry_seconds(attempts: i32) -> i32 {
 
 impl Manager {
     pub async fn prepare_discord(&self) -> Result<()> {
+        let result = self.prepare_discord_inner().await;
+        if let Err(error) = &result {
+            self.log_discord_failure(None, error);
+        }
+        result
+    }
+
+    async fn prepare_discord_inner(&self) -> Result<()> {
         let active = ChannelId::new(self.config.active_category_id)
             .to_channel(&self.http)
-            .await?
+            .await
+            .context(Operation("get_active_category"))?
             .guild()
             .context("Active category is not in a guild")?;
         let completed = ChannelId::new(self.config.completed_category_id)
             .to_channel(&self.http)
-            .await?
+            .await
+            .context(Operation("get_completed_category"))?
             .guild()
             .context("Completed category is not in a guild")?;
         ensure!(
@@ -183,10 +206,28 @@ impl Manager {
         );
         self.discord_guild
             .store(active.guild_id.get(), Ordering::Relaxed);
-        let bot = self.http.get_current_user().await?;
+        let bot = self
+            .http
+            .get_current_user()
+            .await
+            .context(Operation("get_bot_user"))?;
         self.bot_user.store(bot.id.get(), Ordering::Relaxed);
-        let guild = active.guild_id.to_partial_guild(&self.http).await?;
-        let member = active.guild_id.member(&self.http, bot.id).await?;
+        let guild = active
+            .guild_id
+            .to_partial_guild(&self.http)
+            .await
+            .context(Operation("get_guild_permissions"))?;
+        let member = active
+            .guild_id
+            .member(&self.http, bot.id)
+            .await
+            .context(Operation("get_bot_member"))?;
+        ensure!(
+            guild
+                .member_permissions(&member)
+                .contains(Permissions::MANAGE_CHANNELS),
+            "Missing guild permission: Manage Channels is required to create task channels"
+        );
         let required = Permissions::VIEW_CHANNEL
             | Permissions::SEND_MESSAGES
             | Permissions::READ_MESSAGE_HISTORY
@@ -207,11 +248,16 @@ impl Manager {
         let control = if configured != 0 {
             ChannelId::new(configured)
                 .to_channel(&self.http)
-                .await?
+                .await
+                .context(Operation("get_control_channel"))?
                 .guild()
                 .context("Control must be a guild text channel")?
         } else {
-            let channels = active.guild_id.channels(&self.http).await?;
+            let channels = active
+                .guild_id
+                .channels(&self.http)
+                .await
+                .context(Operation("list_control_channels"))?;
             let matches: Vec<_> = channels
                 .values()
                 .filter(|c| c.kind == ChannelType::Text && c.name == "codex-control")
@@ -223,16 +269,18 @@ impl Manager {
             if let Some(channel) = matches.first() {
                 (*channel).clone()
             } else {
-                active
+                let channel = active
                     .guild_id
                     .create_channel(
                         &self.http,
                         CreateChannel::new("codex-control")
                             .kind(ChannelType::Text)
-                            .category(active.id)
-                            .permissions(active.permission_overwrites.clone()),
+                            .category(active.id),
                     )
-                    .await?
+                    .await
+                    .context(Operation("create_control_channel"))?;
+                ensure_category_permissions(&channel, &active)?;
+                channel
             }
         };
         ensure!(
@@ -270,7 +318,13 @@ impl Manager {
         )
         .await;
         if !matches!(result, Ok(Ok(_))) {
-            tracing::warn!("Could not deliver control-channel system notice");
+            let error = match result {
+                Ok(Err(error)) => anyhow::Error::from(error),
+                Err(error) => anyhow::Error::from(error),
+                Ok(Ok(_)) => unreachable!(),
+            }
+            .context(Operation("send_system_notice"));
+            self.log_discord_failure(None, &error);
         }
     }
 
@@ -281,12 +335,35 @@ impl Manager {
         repo: &str,
     ) -> Result<ChannelId> {
         let _guard = self.provisioning_gate.lock().await;
+        let result = self.provision_channel_inner(session, repo).await;
+        if let Err(error) = &result {
+            let current = match self.store.session(session.id).await {
+                Ok(current) => current,
+                Err(persistence_error) => {
+                    self.log_discord_failure(Some(session.id), error);
+                    return Err(persistence_error.context("Could not record channel setup failure; reconcile its session marker before retrying"));
+                }
+            };
+            self.channel_failure(&current, error).await?;
+        }
+        result.map_err(|error| {
+            let diagnostic = self.discord_diagnostic(&error);
+            error.context(format!("{diagnostic}. Use /reconnect session:{} after fixing the error, or /dismiss this failed setup", session.id))
+        })
+    }
+
+    async fn provision_channel_inner(&self, session: &Session, repo: &str) -> Result<ChannelId> {
         let guild = GuildId::new(session.guild_id.parse()?);
-        let channels = guild.channels(&self.http).await?;
+        let channels = guild
+            .channels(&self.http)
+            .await
+            .context(Operation("list_task_channels"))?;
         let matches: Vec<_> = channels
             .values()
             .filter(|c| {
-                c.kind == ChannelType::Text && c.topic.as_deref() == Some(&marker(session.id))
+                c.guild_id == guild
+                    && c.kind == ChannelType::Text
+                    && c.topic.as_deref() == Some(&marker(session.id))
             })
             .collect();
         ensure!(
@@ -304,6 +381,8 @@ impl Manager {
                 "Active category is not a category"
             );
             let taken = channels.values().map(|c| c.name.clone()).collect();
+            // Omit overwrites: Discord copies the parent's permissions on creation. Rewriting
+            // them can require permissions the bot lacks, including administrator-only bits.
             guild
                 .create_channel(
                     &self.http,
@@ -317,18 +396,50 @@ impl Manager {
                     .kind(ChannelType::Text)
                     .category(category.id)
                     .topic(marker(session.id))
-                    .permissions(category.permission_overwrites.clone())
                     .audit_log_reason("Create Codex task channel"),
                 )
-                .await?
+                .await
+                .context(Operation("create_task_channel"))?
         };
-        ensure!(
-            channel.id.get() != self.control_channel.load(Ordering::Relaxed),
-            "Control channel cannot be a task"
-        );
-        sqlx::query("UPDATE sessions SET discord_channel_id=$2,channel_state='active',discord_error=NULL,discord_failures=0,discord_retry_at=now(),last_seen_message_id=$2,updated_at=now() WHERE id=$1")
-            .bind(session.id).bind(channel.id.to_string()).execute(&self.store.pool).await?;
+        // A channel with this marker must be adopted or rejected, never duplicated. For setups
+        // without a conversation, verify privacy before persisting an active presentation.
+        if matches.is_empty() || session.codex_thread_id.is_none() {
+            let category = channels
+                .get(&ChannelId::new(self.config.active_category_id))
+                .context("Active category is missing")?;
+            ensure_category_permissions(&channel, category)?;
+        }
+        self.bind_task_channel(session, &channel).await?;
         Ok(channel.id)
+    }
+
+    pub(crate) async fn bind_task_channel(
+        &self,
+        session: &Session,
+        channel: &GuildChannel,
+    ) -> Result<()> {
+        ensure!(
+            channel.guild_id.to_string() == session.guild_id
+                && channel.kind == ChannelType::Text
+                && channel.topic.as_deref() == Some(&marker(session.id))
+                && channel.id.get() != self.control_channel.load(Ordering::Relaxed)
+                && channel.id.to_string() != session.parent_channel_id,
+            "Invalid task channel ownership; inspect its guild, type and topic"
+        );
+        let mut tx = self.store.pool.begin().await?;
+        let changed = session.channel_id() != Some(channel.id.to_string().as_str());
+        sqlx::query("UPDATE sessions SET discord_channel_id=$2,channel_state='active',discord_error=NULL,discord_failures=0,discord_retry_at=now(),last_seen_message_id=CASE WHEN $3 THEN $2 ELSE last_seen_message_id END,status_message_id=CASE WHEN $3 THEN NULL ELSE status_message_id END,status_delivered_revision=CASE WHEN $3 THEN -1 ELSE status_delivered_revision END,updated_at=now() WHERE id=$1")
+            .bind(session.id).bind(channel.id.to_string()).bind(changed).execute(&mut *tx).await?;
+        if changed {
+            // Routing and redisplay must commit together. A failed status send or restart must
+            // not strand a live approval in the deleted channel or replay an answered request.
+            sqlx::query("DELETE FROM discord_outbox WHERE session_id=$1 AND delivered_at IS NULL AND (dedupe_key LIKE 'task-completed:%' OR dedupe_key LIKE 'task-dismissed:%')")
+                .bind(session.id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE discord_outbox o SET delivered_at=NULL,discord_message_id=NULL,controls_closed=false,attempts=0,next_attempt_at=now() WHERE session_id=$1 AND EXISTS(SELECT 1 FROM pending_requests p WHERE p.session_id=$1 AND p.state='pending' AND p.generation=$2 AND o.dedupe_key LIKE 'request:' || p.id::text || ':%')")
+                .bind(session.id).bind(self.generation).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn task_channel(&self, session: &Session) -> Result<GuildChannel> {
@@ -340,7 +451,8 @@ impl Manager {
         );
         let channel = id
             .to_channel(&self.http)
-            .await?
+            .await
+            .context(Operation("get_task_channel"))?
             .guild()
             .context("Task channel is not in a guild")?;
         ensure!(
@@ -404,7 +516,8 @@ impl Manager {
             {
                 Ok(_) => {}
                 Err(error) => {
-                    let error = anyhow::Error::from(error);
+                    let error =
+                        anyhow::Error::from(error).context(Operation("edit_status_message"));
                     if discord_error_code(&error) == Some(10008) {
                         revision += 1;
                         sqlx::query("UPDATE sessions SET status_message_id=NULL,status_revision=$2,status_delivered_revision=-1 WHERE id=$1")
@@ -424,7 +537,11 @@ impl Manager {
                 if let Some(id) = before {
                     query = query.before(id);
                 }
-                let messages = channel.id.messages(&self.http, query).await?;
+                let messages = channel
+                    .id
+                    .messages(&self.http, query)
+                    .await
+                    .context(Operation("list_status_messages"))?;
                 if let Some(message) = messages.iter().find(|m| {
                     m.author.id.get() == self.bot_user.load(Ordering::Relaxed)
                         && m.embeds.iter().any(|e| {
@@ -443,7 +560,8 @@ impl Manager {
                                 .embed(embed.clone())
                                 .allowed_mentions(CreateAllowedMentions::new()),
                         )
-                        .await?;
+                        .await
+                        .context(Operation("edit_recovered_status_message"))?;
                     break;
                 }
                 before = messages.iter().map(|m| m.id).min();
@@ -462,7 +580,8 @@ impl Manager {
                             .nonce(render::message_nonce("status", channel.id.get(), revision))
                             .enforce_nonce(true),
                     )
-                    .await?;
+                    .await
+                    .context(Operation("create_status_message"))?;
                 message_id = Some(sent.id);
             }
         }
@@ -475,8 +594,13 @@ impl Manager {
         .execute(&self.store.pool)
         .await?;
         // A status link in /status works even without Discord's optional Pin Messages permission.
-        if session.status_message_id.is_none() {
-            let _ = channel.id.pin(&self.http, message_id.unwrap()).await;
+        if session.status_message_id.is_none()
+            && let Err(error) = channel.id.pin(&self.http, message_id.unwrap()).await
+        {
+            self.log_discord_failure(
+                Some(session.id),
+                &anyhow::Error::from(error).context(Operation("pin_status_message")),
+            );
         }
         Ok(())
     }
@@ -484,7 +608,10 @@ impl Manager {
     pub async fn reconcile_channels(&self) -> Result<()> {
         // Also finds a channel created immediately before a crash prevented persisting its ID.
         let guild = GuildId::new(self.discord_guild.load(Ordering::Relaxed));
-        let channels = guild.channels(&self.http).await?;
+        let channels = guild
+            .channels(&self.http)
+            .await
+            .context(Operation("list_channels_for_recovery"))?;
         let sessions: Vec<Session> = sqlx::query_as("SELECT * FROM sessions WHERE channel_kind='text' AND discord_channel_id IS NULL AND channel_state='provisioning'")
             .fetch_all(&self.store.pool).await?;
         for session in sessions {
@@ -497,19 +624,45 @@ impl Manager {
             let found: Vec<_> = channels
                 .values()
                 .filter(|c| {
-                    c.kind == ChannelType::Text && c.topic.as_deref() == Some(&marker(session.id))
+                    c.guild_id.to_string() == session.guild_id
+                        && c.kind == ChannelType::Text
+                        && c.topic.as_deref() == Some(&marker(session.id))
                 })
                 .collect();
             if found.len() == 1 {
-                sqlx::query(
-                    "UPDATE sessions SET discord_channel_id=$2,channel_state='active' WHERE id=$1",
-                )
-                .bind(session.id)
-                .bind(found[0].id.to_string())
-                .execute(&self.store.pool)
-                .await?;
+                let result = async {
+                    if session.codex_thread_id.is_none() {
+                        let category = channels
+                            .get(&ChannelId::new(self.config.active_category_id))
+                            .context("Active category is missing")?;
+                        ensure_category_permissions(found[0], category)?;
+                    }
+                    self.bind_task_channel(&session, found[0]).await
+                }
+                .await;
+                if let Err(error) = result {
+                    self.channel_failure(&session, &error).await?;
+                }
             } else {
-                self.channel_failure(&session, &anyhow::anyhow!("Channel creation was interrupted or ambiguous; use /reconnect with this session ID")).await?;
+                // Preserve a recorded API failure instead of replacing it with a generic guess.
+                if found.is_empty() {
+                    sqlx::query("UPDATE sessions SET channel_state='missing' WHERE id=$1")
+                        .bind(session.id)
+                        .execute(&self.store.pool)
+                        .await?;
+                }
+                if session.discord_error.is_none() || found.len() > 1 {
+                    let message = if found.is_empty() {
+                        "No channel found after interrupted setup; use /reconnect with this session ID or /dismiss the failed setup"
+                    } else {
+                        "Multiple channels carry this session marker; inspect them before reconnecting"
+                    };
+                    self.channel_failure(
+                        &session,
+                        &anyhow::anyhow!(message).context(Operation("reconcile_channel_creation")),
+                    )
+                    .await?;
+                }
             }
         }
         let sessions: Vec<Session> = sqlx::query_as("SELECT * FROM sessions WHERE COALESCE(discord_channel_id,discord_thread_id) IS NOT NULL AND channel_state NOT IN ('deleted','missing')")
@@ -528,7 +681,7 @@ impl Manager {
                         Ok(message) => ensure!(message.author.id.get() == self.bot_user.load(Ordering::Relaxed)
                             && message.embeds.iter().any(|e| e.footer.as_ref().is_some_and(|f| f.text == status_marker(s.id))), "Stored status message does not belong to this task"),
                         Err(error) => {
-                            let error = anyhow::Error::from(error);
+                            let error = anyhow::Error::from(error).context(Operation("get_status_message"));
                             if discord_error_code(&error) == Some(10008) {
                                 sqlx::query("UPDATE sessions SET status_message_id=NULL,status_revision=status_revision+1,status_delivered_revision=-1 WHERE id=$1")
                                     .bind(s.id).execute(&self.store.pool).await?;
@@ -545,20 +698,26 @@ impl Manager {
         Ok(())
     }
 
-    async fn channel_failure(&self, session: &Session, error: &anyhow::Error) -> Result<()> {
-        let missing = discord_error_code(error) == Some(10003);
-        let message = if missing {
-            "Discord channel was deleted. Codex state is preserved; use /reconnect with this session ID.".into()
-        } else {
-            render::truncate(&error.to_string(), 300)
-        };
+    pub(crate) async fn channel_failure(
+        &self,
+        session: &Session,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.log_discord_failure(Some(session.id), error);
+        let missing = (session.channel_id().is_some() && discord_error_code(error) == Some(10003))
+            || (session.channel_id().is_none() && errors::creation_rejected(error));
+        let mut message = self.discord_diagnostic(error);
+        if missing {
+            message.push_str(". Channel unavailable; use /reconnect with this session ID. Codex state is preserved.");
+        } else if session.channel_id().is_none() {
+            message.push_str(". No create request will be retried automatically; /reconnect searches for an existing channel first.");
+        }
         sqlx::query("UPDATE sessions SET channel_state=CASE WHEN $2 THEN 'missing' ELSE channel_state END,discord_error=$3,discord_failures=discord_failures+1,discord_retry_at=now()+make_interval(secs => $4::double precision) WHERE id=$1")
             .bind(session.id).bind(missing).bind(&message).bind(f64::from(retry_seconds(session.discord_failures))).execute(&self.store.pool).await?;
         if session.discord_error.as_deref() != Some(&message) {
             self.system_notice(&format!("Task `{}` needs attention: {message}", session.id))
                 .await;
         }
-        tracing::warn!(session_id=%session.id, "Discord channel maintenance failed; execution state preserved");
         Ok(())
     }
 
@@ -588,7 +747,8 @@ impl Manager {
                 tokio::time::timeout(Duration::from_secs(20), self.maintain_channel(&session))
                     .await
                     .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!("Discord channel maintenance timed out"))
+                        Err(anyhow::anyhow!("Discord channel maintenance timed out")
+                            .context(Operation("maintain_task_channel")))
                     });
             match result {
                 Ok(()) => {
@@ -610,7 +770,8 @@ impl Manager {
             channel
                 .id
                 .edit_thread(&self.http, EditThread::new().archived(false))
-                .await?;
+                .await
+                .context(Operation("unarchive_legacy_thread"))?;
         }
         self.sync_status(session).await?;
         if session.channel_kind != "text" {
@@ -635,7 +796,8 @@ impl Manager {
                         .category(target)
                         .audit_log_reason("Update Codex task lifecycle"),
                 )
-                .await?;
+                .await
+                .context(Operation("move_task_channel"))?;
         }
         if current.cleanup_due(Utc::now(), self.control_channel.load(Ordering::Relaxed))
             && !self.store.unresolved(current.id).await?
@@ -643,7 +805,11 @@ impl Manager {
             && !self.unread_task_input(&current, channel.id).await?
         {
             // This gate also guards normal input, completion, and interactive responses.
-            channel.id.delete(&self.http).await?;
+            channel
+                .id
+                .delete(&self.http)
+                .await
+                .context(Operation("delete_task_channel"))?;
             sqlx::query("UPDATE sessions SET channel_state='deleted' WHERE id=$1")
                 .bind(current.id)
                 .execute(&self.store.pool)
@@ -665,7 +831,8 @@ impl Manager {
                     .after(MessageId::new(snowflake.max(1)))
                     .limit(100),
             )
-            .await?;
+            .await
+            .context(Operation("list_messages_before_cleanup"))?;
         for message in &messages {
             if self.config.access.allows(
                 message.author.id.get(),

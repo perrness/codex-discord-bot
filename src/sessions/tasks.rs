@@ -33,14 +33,26 @@ impl Manager {
         let _guard = gate.lock().await;
         let session = self.store.session(id).await?;
         ensure!(session.guild_id == guild.to_string(), "Wrong guild");
-        ensure!(
-            session.channel_kind == "text",
-            "Legacy threads remain available and are not automatically moved or deleted"
-        );
-        ensure!(
-            session.channel_state == "active",
-            "Task is not active; use /reconnect if its channel is missing"
-        );
+        let legacy = session.channel_kind == "thread";
+        let failed_setup = !legacy
+            && session.channel_state == "missing"
+            && session.channel_id().is_none()
+            && session.codex_thread_id.is_none();
+        if legacy {
+            ensure!(
+                dismiss,
+                "Use /dismiss to hide a legacy thread from /sessions"
+            );
+            ensure!(
+                session.channel_state == "legacy",
+                "Legacy thread is already dismissed or unavailable; check /status"
+            );
+        } else {
+            ensure!(
+                session.channel_state == "active" || (dismiss && failed_setup),
+                "Task is not active; use /reconnect if its channel is missing"
+            );
+        }
         ensure!(
             !session.repository_claimed
                 && session.current_turn_id.is_none()
@@ -55,6 +67,20 @@ impl Manager {
             dismiss || session.last_outcome.as_deref() == Some("completed"),
             "The last turn did not succeed; continue the task or explicitly /dismiss it"
         );
+        if failed_setup {
+            sqlx::query("UPDATE sessions SET channel_state='dismissed',completed_at=now(),delete_after=NULL,updated_at=now() WHERE id=$1")
+                .bind(id).execute(&self.store.pool).await?;
+            return Ok("Failed setup dismissed. No Codex work was submitted; use /codex to start a new task.".into());
+        }
+        if legacy {
+            ensure!(
+                !self.store.undelivered(id).await?,
+                "Wait for queued messages to be delivered before dismissing this thread"
+            );
+            sqlx::query("UPDATE sessions SET channel_state='dismissed',completed_at=now(),delete_after=NULL,updated_at=now() WHERE id=$1")
+                .bind(id).execute(&self.store.pool).await?;
+            return Ok("Legacy thread hidden from /sessions. Its history is retained; reply in the thread to reopen it.".into());
+        }
         let state = if dismiss { "dismissed" } else { "completed" };
         let mut tx = self.store.pool.begin().await?;
         sqlx::query("UPDATE sessions SET channel_state=$2,completed_at=now(),delete_after=now()+make_interval(secs => $3::double precision),updated_at=now() WHERE id=$1")
@@ -100,23 +126,40 @@ impl Manager {
             "Existing threads retain their original routing"
         );
         // An explicit recovery command may replace a deleted channel, but never replays a turn.
+        let mut existing = None;
         if let Some(channel) = session.channel_id() {
             match self.task_channel(&session).await {
-                Ok(_) => return Ok(format!("Task channel: <#{channel}>")),
+                Ok(found) => {
+                    if matches!(
+                        session.channel_state.as_str(),
+                        "missing" | "provisioning" | "deleted"
+                    ) {
+                        self.bind_task_channel(&session, &found).await?;
+                    }
+                    existing = Some(serenity::all::ChannelId::new(channel.parse()?));
+                }
                 Err(error)
                     if crate::discord::channels::discord_error_code(&error) == Some(10003) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.channel_failure(&session, &error).await?;
+                    let diagnostic = self.discord_diagnostic(&error);
+                    return Err(error.context(diagnostic));
+                }
             }
         }
-        sqlx::query("UPDATE sessions SET discord_channel_id=NULL,status_message_id=NULL,channel_state='provisioning',completed_at=NULL,delete_after=NULL,discord_retry_at=now(),discord_failures=0,discord_error=NULL WHERE id=$1")
+        let channel = if let Some(channel) = existing {
+            channel
+        } else {
+            sqlx::query("UPDATE sessions SET discord_channel_id=NULL,status_message_id=NULL,last_seen_message_id=NULL,channel_state='provisioning',completed_at=NULL,delete_after=NULL,discord_retry_at=now() WHERE id=$1")
             .bind(id).execute(&self.store.pool).await?;
-        let repo: Repository = sqlx::query_as("SELECT id,name,path FROM repositories WHERE id=$1")
-            .bind(session.repository_id)
-            .fetch_one(&self.store.pool)
-            .await?;
-        let channel = self
-            .provision_channel(&self.store.session(id).await?, &repo.name)
-            .await?;
+            let repo: Repository =
+                sqlx::query_as("SELECT id,name,path FROM repositories WHERE id=$1")
+                    .bind(session.repository_id)
+                    .fetch_one(&self.store.pool)
+                    .await?;
+            self.provision_channel(&self.store.session(id).await?, &repo.name)
+                .await?
+        };
         if let (Some(thread), Some(turn)) = (&session.codex_thread_id, &session.current_turn_id) {
             let mut live = self.live.lock().unwrap();
             if let Some(old) = session.channel_id().and_then(|c| c.parse().ok()) {
@@ -124,12 +167,37 @@ impl Manager {
             }
             live.insert(channel.get(), (thread.clone(), turn.clone()));
         }
-        self.sync_status(&self.store.session(id).await?).await?;
-        sqlx::query("DELETE FROM discord_outbox WHERE session_id=$1 AND delivered_at IS NULL AND (dedupe_key LIKE 'task-completed:%' OR dedupe_key LIKE 'task-dismissed:%')")
-            .bind(id).execute(&self.store.pool).await?;
-        // Redisplay still-live prompts and their complete previews, without replaying any response.
-        sqlx::query("UPDATE discord_outbox o SET delivered_at=NULL,discord_message_id=NULL,controls_closed=false,attempts=0,next_attempt_at=now() WHERE session_id=$1 AND EXISTS(SELECT 1 FROM pending_requests p WHERE p.session_id=$1 AND p.state='pending' AND p.generation=$2 AND o.dedupe_key LIKE 'request:' || p.id::text || ':%')")
-            .bind(id).bind(self.generation).execute(&self.store.pool).await?;
+        let fresh_setup = session.codex_thread_id.is_none()
+            && !session.repository_claimed
+            && session.current_turn_id.is_none()
+            && matches!(session.status.as_str(), "idle" | "unavailable");
+        if fresh_setup {
+            // No turn can have been sent without a persisted conversation ID. An explicit new
+            // message may start this setup, but /reconnect itself never submits or replays work.
+            let mut tx = self.store.pool.begin().await?;
+            sqlx::query("UPDATE sessions SET status='idle',last_error=NULL WHERE id=$1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE inbound_requests SET state='rejected',updated_at=now() WHERE session_id=$1 AND state IN ('received','uncertain')")
+                .bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        let current = self.store.session(id).await?;
+        if let Err(error) = self.sync_status(&current).await {
+            self.channel_failure(&current, &error).await?;
+            let diagnostic = self.discord_diagnostic(&error);
+            return Err(error.context(diagnostic));
+        }
+        sqlx::query("UPDATE sessions SET discord_error=NULL,discord_failures=0 WHERE id=$1")
+            .bind(id)
+            .execute(&self.store.pool)
+            .await?;
+        if fresh_setup {
+            return Ok(format!(
+                "Reconnected in <#{channel}>. No Codex work was submitted. Send a new task message there to begin, or /dismiss this setup."
+            ));
+        }
         Ok(format!(
             "Reconnected in <#{channel}>. No Codex work was replayed."
         ))

@@ -1,5 +1,6 @@
 pub mod channels;
 mod commands;
+pub(crate) mod errors;
 mod outbox;
 pub mod render;
 
@@ -25,13 +26,17 @@ impl EventHandler for Handler {
             }
             None => Command::set_global_commands(&ctx.http, commands::definitions()).await,
         };
-        if result.is_err() {
-            tracing::error!("Discord command registration failed; check application permissions");
+        if let Err(error) = result {
+            self.manager.log_discord_failure(
+                None,
+                &anyhow::Error::from(error).context(errors::Operation("register_commands")),
+            );
             self.manager.system_notice("Discord slash-command registration failed. Check application permissions and service logs.").await;
         } else {
             tracing::info!("Discord connected; commands registered");
         }
-        if self.manager.reconcile_channels().await.is_err() {
+        if let Err(error) = self.manager.reconcile_channels().await {
+            self.manager.log_discord_failure(None, &error);
             self.manager.system_notice("Discord channel reconciliation failed. Each task channel will be checked again before updates or cleanup; Codex execution state is preserved.").await;
         }
         if self.backfill().await.is_err() {
@@ -59,9 +64,10 @@ impl EventHandler for Handler {
             Interaction::Modal(modal) => self.modal(&ctx, modal).await,
             _ => Ok(()),
         };
-        if result.is_err() {
-            tracing::warn!(
-                "Discord interaction response failed; check connectivity and permissions"
+        if let Err(error) = result {
+            self.manager.log_discord_failure(
+                None,
+                &error.context(errors::Operation("respond_to_interaction")),
             );
         }
     }
@@ -208,7 +214,10 @@ impl Handler {
         }
         command.defer_ephemeral(&ctx.http).await?;
         let result = commands::execute(&self.manager, &command).await;
-        let text = result.unwrap_or_else(|e| e.to_string());
+        let text = result.unwrap_or_else(|error| {
+            self.manager.log_discord_failure(None, &error);
+            error.to_string()
+        });
         command
             .edit_response(
                 &ctx.http,

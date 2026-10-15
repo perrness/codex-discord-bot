@@ -31,8 +31,11 @@ pub struct State {
     pub messages: HashMap<String, Vec<Value>>,
     pub calls: Vec<(String, String, Value)>,
     pub fail_next: Option<(String, String, u16, i64)>,
+    pub fail_after_create: Option<(u16, i64)>,
+    pub fail_message: Option<String>,
+    pub created_overwrites: Option<Value>,
     pub permissions: u64,
-    next_id: u64,
+    pub next_id: u64,
     nonces: HashMap<String, Value>,
 }
 
@@ -54,7 +57,11 @@ impl State {
             let (_, _, status, code) = self.fail_next.take().unwrap();
             return (
                 status,
-                json!({"code":code,"message":"Injected API failure"}),
+                json!({"code":code,"message": self.fail_message.take().unwrap_or_else(|| match code {
+                    50013 => "Missing Permissions".into(),
+                    50001 => "Missing Access".into(),
+                    _ => "Injected API failure".into(),
+                })}),
             );
         }
         let parts: Vec<_> = path.trim_matches('/').split('/').collect();
@@ -76,12 +83,42 @@ impl State {
                 (200, json!(self.channels.values().collect::<Vec<_>>()))
             }
             ("POST", ["guilds", "7", "channels"]) => {
+                use serenity::all::Permissions;
+                let explicit = body["permission_overwrites"].as_array();
+                let requested = explicit.into_iter().flatten().fold(0, |bits, p| {
+                    bits | p["allow"].as_str().unwrap_or("0").parse::<u64>().unwrap()
+                        | p["deny"].as_str().unwrap_or("0").parse::<u64>().unwrap()
+                });
+                if self.permissions & Permissions::ADMINISTRATOR.bits() == 0
+                    && (self.permissions & Permissions::MANAGE_CHANNELS.bits() == 0
+                        || requested & !self.permissions != 0
+                        || requested & Permissions::MANAGE_ROLES.bits() != 0)
+                {
+                    return (403, json!({"code":50013,"message":"Missing Permissions"}));
+                }
                 self.next_id += 1;
                 let id = self.next_id.to_string();
                 let mut result = body;
+                if result.get("permission_overwrites").is_none() {
+                    // Omitting overwrites preserves the parent's complete visibility rules.
+                    result["permission_overwrites"] = self
+                        .channels
+                        .get(result["parent_id"].as_str().unwrap())
+                        .unwrap()["permission_overwrites"]
+                        .clone();
+                }
+                if let Some(overwrites) = self.created_overwrites.take() {
+                    result["permission_overwrites"] = overwrites;
+                }
                 result["id"] = json!(id);
                 result["guild_id"] = json!("7");
                 self.channels.insert(id, result.clone());
+                if let Some((status, code)) = self.fail_after_create.take() {
+                    return (
+                        status,
+                        json!({"code":code,"message":"Response lost after creation"}),
+                    );
+                }
                 (200, result)
             }
             (_, ["channels", id, ..]) if !self.channels.contains_key(*id) => {
@@ -187,6 +224,9 @@ impl Api {
             messages: HashMap::new(),
             calls: Vec::new(),
             fail_next: None,
+            fail_after_create: None,
+            fail_message: None,
+            created_overwrites: None,
             permissions: serenity::all::Permissions::all().bits()
                 & !serenity::all::Permissions::ADMINISTRATOR.bits(),
             next_id: 1000,

@@ -210,7 +210,11 @@ impl Fixture {
             .await?;
         let repo = self.manager.store.repository(name).await?;
         self.manager.store.receipt(name, "task", None).await?;
-        let session = self.manager.store.reserve(&repo, 42, 7, 8, name).await?;
+        let session = self
+            .manager
+            .store
+            .reserve(&repo, 42, 7, 8, name, None)
+            .await?;
         self.manager.store.receipt_state(name, "accepted").await?;
         sqlx::query("UPDATE sessions SET discord_thread_id=$2,codex_thread_id=$3,current_turn_id=$4,status=$5,repository_claimed=$6 WHERE id=$1")
             .bind(session.id).bind(channel.to_string()).bind(thread).bind(if idle {None} else {Some(turn)})
@@ -261,8 +265,8 @@ async fn database_constraints_prevent_duplicate_repository_execution() -> Result
     let first = f.seed("repo", 100, "thread-1", "turn-1", false).await?;
     let repo = f.manager.store.repository("repo").await?;
     let (a, b) = tokio::join!(
-        f.manager.store.reserve(&repo, 42, 7, 8, "a"),
-        f.manager.store.reserve(&repo, 42, 7, 8, "b")
+        f.manager.store.reserve(&repo, 42, 7, 8, "a", None),
+        f.manager.store.reserve(&repo, 42, 7, 8, "b", None)
     );
     assert!(a.is_err() && b.is_err());
     let second = f.seed("other", 101, "thread-2", "turn-2", false).await?;
@@ -726,12 +730,146 @@ async fn recovery_adopts_existing_channel_and_status_then_reconnects_missing_cha
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
+async fn dismissing_legacy_threads_preserves_history_and_followups_restore_visibility() -> Result<()>
+{
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    let visible = f
+        .seed("visible", 100, "visible-thread", "turn", true)
+        .await?;
+    f.text_channel(&visible, &api).await?;
+    let legacy = f.seed("legacy", 101, "legacy-thread", "turn", true).await?;
+    api.state
+        .lock()
+        .unwrap()
+        .channels
+        .insert("101".into(), discord::channel("101", 11, 8, ""));
+
+    let result = f.manager.finish_task(42, 7, legacy.id, true).await?;
+    assert!(result.contains("hidden from /sessions"));
+    let dismissed = f.manager.store.session(legacy.id).await?;
+    assert_eq!(dismissed.channel_state, "dismissed");
+    assert_eq!(dismissed.codex_thread_id, legacy.codex_thread_id);
+    assert_eq!(dismissed.discord_thread_id, legacy.discord_thread_id);
+    assert_eq!(dismissed.status, "idle");
+    assert!(!dismissed.repository_claimed);
+    assert!(dismissed.completed_at.is_some() && dismissed.delete_after.is_none());
+    assert!(!dismissed.cleanup_due(chrono::Utc::now(), 8));
+    assert_eq!(
+        f.manager.store.by_discord(101).await?.unwrap().id,
+        legacy.id
+    );
+    assert_eq!(
+        f.manager.store.by_codex("legacy-thread").await?.unwrap().id,
+        legacy.id
+    );
+    // Hidden records must not consume the list limit or hide current text channels.
+    let listed = f.manager.store.sessions(1).await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, visible.id);
+    assert!(!f.manager.store.undelivered(legacy.id).await?);
+    assert_eq!(f.mock.count("turn/start"), 0);
+    f.manager.maintain_channels_once().await?;
+    assert_eq!(api.state.lock().unwrap().channels["101"]["parent_id"], "8");
+    assert_eq!(
+        api.state.lock().unwrap().count("DELETE", "/channels/101"),
+        0
+    );
+
+    f.manager
+        .followup(42, 7, 101, "200", "Continue this legacy conversation")
+        .await?;
+    let reopened = f.manager.store.session(legacy.id).await?;
+    assert_eq!(reopened.channel_state, "legacy");
+    assert!(reopened.completed_at.is_none() && reopened.delete_after.is_none());
+    assert_eq!(reopened.codex_thread_id, legacy.codex_thread_id);
+    assert_eq!(reopened.discord_thread_id, legacy.discord_thread_id);
+    assert_eq!(f.manager.store.sessions(1).await?[0].id, legacy.id);
+    assert_eq!(f.mock.count("thread/resume"), 1);
+    assert_eq!(f.mock.count("turn/start"), 1);
+    f.mock.send(json!({"method":"turn/completed","params":{"threadId":"legacy-thread","turn":{"id":"turn-new","status":"completed"}}})).await;
+    f.status(legacy.id, "idle").await?;
+    f.manager.finish_task(42, 7, legacy.id, true).await?;
+    assert_eq!(f.manager.store.sessions(1).await?[0].id, visible.id);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn legacy_dismissal_requires_authorization_idle_state_and_resolved_input_and_output()
+-> Result<()> {
+    let f = Fixture::new().await?;
+    let s = f
+        .seed("legacy", 101, "legacy-thread", "turn", false)
+        .await?;
+    assert!(f.manager.finish_task(99, 7, s.id, true).await.is_err());
+    assert!(f.manager.finish_task(42, 8, s.id, true).await.is_err());
+    assert!(f.manager.finish_task(42, 7, s.id, true).await.is_err());
+    sqlx::query("UPDATE sessions SET status='idle',repository_claimed=false,current_turn_id=NULL WHERE id=$1")
+        .bind(s.id).execute(&f.manager.store.pool).await?;
+    assert!(f.manager.finish_task(42, 7, s.id, false).await.is_err());
+
+    f.manager
+        .store
+        .receipt("uncertain", "message", Some(s.id))
+        .await?;
+    f.manager
+        .store
+        .receipt_state("uncertain", "uncertain")
+        .await?;
+    assert!(f.manager.finish_task(42, 7, s.id, true).await.is_err());
+    f.manager
+        .store
+        .receipt_state("uncertain", "rejected")
+        .await?;
+    let pending = Uuid::new_v4();
+    sqlx::query("INSERT INTO pending_requests(id,session_id,generation,rpc_id,method,turn_id,payload,state) VALUES($1,$2,$3,'1','item/tool/requestUserInput','turn','{}','pending')")
+        .bind(pending).bind(s.id).bind(f.manager.generation).execute(&f.manager.store.pool).await?;
+    assert!(f.manager.finish_task(42, 7, s.id, true).await.is_err());
+    sqlx::query("UPDATE pending_requests SET state='resolved' WHERE id=$1")
+        .bind(pending)
+        .execute(&f.manager.store.pool)
+        .await?;
+    sqlx::query("INSERT INTO discord_outbox(dedupe_key,session_id,content) VALUES('legacy-final',$1,'Final reply')")
+        .bind(s.id).execute(&f.manager.store.pool).await?;
+    assert!(f.manager.finish_task(42, 7, s.id, true).await.is_err());
+    assert_eq!(f.manager.store.session(s.id).await?.channel_state, "legacy");
+    sqlx::query("UPDATE discord_outbox SET delivered_at=now() WHERE session_id=$1")
+        .bind(s.id)
+        .execute(&f.manager.store.pool)
+        .await?;
+
+    f.manager.finish_task(42, 7, s.id, true).await?;
+    assert!(f.manager.store.sessions(20).await?.is_empty());
+    let pending: PendingRequest = sqlx::query_as("SELECT * FROM pending_requests WHERE id=$1")
+        .bind(pending)
+        .fetch_one(&f.manager.store.pool)
+        .await?;
+    assert_eq!(pending.state, "resolved");
+    let delivered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM discord_outbox WHERE session_id=$1 AND delivered_at IS NOT NULL",
+    )
+    .bind(s.id)
+    .fetch_one(&f.manager.store.pool)
+    .await?;
+    assert_eq!(delivered, 1);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
 async fn cleanup_rejects_pending_input_unowned_channels_and_legacy_threads() -> Result<()> {
     let api = discord::Api::start().await;
     let f = Fixture::with_http(api.http.clone()).await?;
     f.manager.prepare_discord().await?;
     let legacy = f.seed("legacy", 101, "legacy-thread", "turn", true).await?;
-    assert!(f.manager.finish_task(42, 7, legacy.id, true).await.is_err());
+    assert!(
+        f.manager
+            .finish_task(42, 7, legacy.id, false)
+            .await
+            .is_err()
+    );
     let s = f.seed("cleanup", 100, "thread", "turn", true).await?;
     let s = f.text_channel(&s, &api).await?;
     let pending = Uuid::new_v4();
@@ -855,7 +993,7 @@ async fn text_channels_isolate_concurrent_followups_and_reopen_completed_tasks()
     let repo = f.manager.store.repository("alpha").await?;
     f.manager
         .store
-        .reserve(&repo, 42, 7, 8, "another-task")
+        .reserve(&repo, 42, 7, 8, "another-task", None)
         .await?;
     assert!(
         f.manager
@@ -1135,6 +1273,517 @@ async fn failed_channel_creation_never_submits_or_replays_codex_work() -> Result
         1
     );
     assert_eq!(f.mock.count("thread/start"), 0);
+    assert_eq!(f.mock.count("turn/start"), 0);
+    f.cleanup().await
+}
+
+fn task_permissions() -> serenity::all::Permissions {
+    use serenity::all::Permissions as P;
+    P::VIEW_CHANNEL
+        | P::SEND_MESSAGES
+        | P::READ_MESSAGE_HISTORY
+        | P::MANAGE_CHANNELS
+        | P::MANAGE_MESSAGES
+        | P::EMBED_LINKS
+        | P::ATTACH_FILES
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn private_channels_inherit_overwrites_without_requesting_extra_privileges() -> Result<()> {
+    use serenity::all::{CreateChannel, GuildId, Permissions as P};
+    let api = discord::Api::start().await;
+    let overwrites = json!([
+        {"id":"7","type":0,"allow":"0","deny":P::VIEW_CHANNEL.bits().to_string()},
+        {"id":"99","type":1,"allow":(task_permissions() | P::MANAGE_ROLES | P::MANAGE_WEBHOOKS).bits().to_string(),"deny":"0"}
+    ]);
+    {
+        let mut state = api.state.lock().unwrap();
+        state.permissions = task_permissions().bits();
+        for id in ["8", "9", "10"] {
+            state.channels.get_mut(id).unwrap()["permission_overwrites"] = overwrites.clone();
+        }
+    }
+    // Reproduce the old request against Discord's overwrite restrictions.
+    let copied =
+        serde_json::from_value::<Vec<serenity::all::PermissionOverwrite>>(overwrites.clone())?;
+    let old_error = GuildId::new(7)
+        .create_channel(
+            &api.http,
+            CreateChannel::new("old-request")
+                .category(9)
+                .permissions(copied),
+        )
+        .await
+        .unwrap_err();
+    assert!(old_error.to_string().contains("Missing Permissions"));
+
+    let f = Fixture::with_control(api.http.clone(), 0).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("private", true).await?;
+    f.manager
+        .create_task(42, 7, "private", "private", "Private task")
+        .await?;
+    let s = f.manager.store.sessions(1).await?.remove(0);
+    {
+        let state = api.state.lock().unwrap();
+        assert_eq!(
+            state.channels[s.channel_id().unwrap()]["permission_overwrites"],
+            overwrites
+        );
+        for (_, _, body) in state
+            .calls
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/guilds/7/channels")
+            .skip(1)
+        {
+            assert!(body.get("permission_overwrites").is_none());
+            assert_eq!(body["parent_id"], "9");
+        }
+    }
+    // Category-only Manage Channels must not mask its absence at guild scope.
+    api.state.lock().unwrap().permissions &= !P::MANAGE_CHANNELS.bits();
+    assert!(
+        f.manager
+            .prepare_discord()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Missing guild permission")
+    );
+    f.cleanup().await
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn permission_rejection_keeps_diagnostics_and_reconnect_allows_only_explicit_new_input()
+-> Result<()> {
+    use tracing::instrument::WithSubscriber;
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("denied", true).await?;
+    {
+        let mut state = api.state.lock().unwrap();
+        state.fail_next = Some(("POST".into(), "/guilds/7/channels".into(), 403, 50013));
+        state.fail_message = Some(format!(
+            "Missing Permissions {} {}",
+            f.manager.config.discord_token, f.manager.config.database_url
+        ));
+    }
+    let log = LogCapture::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || writer.clone())
+        .finish();
+    let error = f
+        .manager
+        .create_task(42, 7, "denied", "denied", "Original task")
+        .with_subscriber(subscriber)
+        .await
+        .unwrap_err();
+    let s = f.manager.store.sessions(1).await?.remove(0);
+    assert_eq!(s.channel_state, "missing");
+    assert_eq!(s.status, "unavailable");
+    assert!(s.channel_id().is_none() && s.codex_thread_id.is_none() && !s.repository_claimed);
+    let diagnostic = s.discord_error.as_deref().unwrap();
+    for expected in [
+        "create_task_channel",
+        "HTTP 403",
+        "Discord 50013",
+        "Missing Permissions",
+    ] {
+        assert!(diagnostic.contains(expected), "{diagnostic}");
+        assert!(error.to_string().contains(expected));
+    }
+    let logs = String::from_utf8(log.0.lock().unwrap().clone())?;
+    let records: Vec<Value> = logs
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let fields = &records
+        .iter()
+        .find(|r| r["fields"]["operation"] == "create_task_channel")
+        .unwrap()["fields"];
+    assert_eq!(fields["http_status"], 403);
+    assert_eq!(fields["discord_code"], 50013);
+    assert_eq!(fields["session_id"], s.id.to_string());
+    for secret in [
+        &f.manager.config.discord_token,
+        &f.manager.config.database_url,
+    ] {
+        assert!(
+            !logs.contains(secret)
+                && !diagnostic.contains(secret)
+                && !error.to_string().contains(secret)
+        );
+    }
+    f.manager.recover().await?;
+    f.manager.reconcile_channels().await?;
+    f.manager.maintain_channels_once().await?;
+    assert_eq!(
+        f.manager.store.session(s.id).await?.discord_error,
+        s.discord_error
+    );
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
+    assert_eq!(f.mock.count("thread/start"), 0);
+
+    let (a, b) = tokio::join!(
+        f.manager.reconnect_channel(42, 7, s.id),
+        f.manager.reconnect_channel(42, 7, s.id)
+    );
+    assert!(a?.contains("Send a new task message"));
+    b?;
+    let restored = f.manager.store.session(s.id).await?;
+    assert_eq!(restored.status, "idle");
+    assert_eq!(restored.channel_state, "active");
+    assert!(restored.codex_thread_id.is_none());
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        2
+    );
+    assert_eq!(f.mock.count("turn/start"), 0);
+    f.manager
+        .followup(
+            42,
+            7,
+            restored.channel_id().unwrap().parse()?,
+            "new-input",
+            "New authorized task",
+        )
+        .await?;
+    assert_eq!(f.mock.count("thread/start"), 1);
+    assert_eq!(f.mock.count("turn/start"), 1);
+    let observed = f.mock.observed.lock().unwrap().clone();
+    let turn = observed
+        .iter()
+        .find(|v| v["method"] == "turn/start")
+        .unwrap();
+    assert_eq!(turn["params"]["input"][0]["text"], "New authorized task");
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn ambiguous_success_is_adopted_on_restart_without_duplicate_channels_or_task_replay()
+-> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("ambiguous", true).await?;
+    api.state.lock().unwrap().fail_after_create = Some((502, 0));
+    assert!(
+        f.manager
+            .create_task(42, 7, "ambiguous", "ambiguous", "Task")
+            .await
+            .is_err()
+    );
+    let s = f.manager.store.sessions(1).await?.remove(0);
+    assert_eq!(s.channel_state, "provisioning");
+    assert!(s.discord_error.as_deref().unwrap().contains("HTTP 502"));
+    assert!(s.channel_id().is_none());
+    // Simulate a crash with a setup receipt still pending, before cleanup committed.
+    sqlx::query("UPDATE sessions SET status='provisioning',repository_claimed=true WHERE id=$1")
+        .bind(s.id)
+        .execute(&f.manager.store.pool)
+        .await?;
+    f.manager
+        .store
+        .receipt_state("ambiguous", "received")
+        .await?;
+    f.manager.recover().await?;
+    f.manager.reconcile_channels().await?;
+    f.manager.maintain_channels_once().await?;
+    let adopted = f.manager.store.session(s.id).await?;
+    assert_eq!(adopted.channel_id(), Some("1001"));
+    assert!(!adopted.repository_claimed && adopted.codex_thread_id.is_none());
+    let receipt: String =
+        sqlx::query_scalar("SELECT state FROM inbound_requests WHERE discord_id='ambiguous'")
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!(receipt, "rejected");
+    f.manager.reconnect_channel(42, 7, s.id).await?;
+    f.manager.reconnect_channel(42, 7, s.id).await?;
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
+    assert_eq!(f.mock.count("thread/start"), 0);
+    assert_eq!(f.mock.count("turn/start"), 0);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn reconnect_requires_a_successful_unique_marker_lookup_before_creating() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("lookup", true).await?;
+    api.state.lock().unwrap().fail_next =
+        Some(("POST".into(), "/guilds/7/channels".into(), 503, 0));
+    assert!(
+        f.manager
+            .create_task(42, 7, "lookup", "lookup", "Task")
+            .await
+            .is_err()
+    );
+    let s = f.manager.store.sessions(1).await?.remove(0);
+    f.manager.reconcile_channels().await?;
+    assert_eq!(
+        f.manager.store.session(s.id).await?.discord_error,
+        s.discord_error
+    );
+    api.state.lock().unwrap().fail_next =
+        Some(("GET".into(), "/guilds/7/channels".into(), 403, 50001));
+    let error = f.manager.reconnect_channel(42, 7, s.id).await.unwrap_err();
+    assert!(error.to_string().contains("list_task_channels"));
+    {
+        let mut state = api.state.lock().unwrap();
+        for id in ["2001", "2002"] {
+            state.channels.insert(
+                id.into(),
+                discord::channel(id, 0, 9, &format!("codex-task:{}", s.id)),
+            );
+        }
+    }
+    assert!(
+        f.manager
+            .reconnect_channel(42, 7, s.id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple channels")
+    );
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
+    api.state.lock().unwrap().channels.remove("2002");
+    f.manager.reconnect_channel(42, 7, s.id).await?;
+    assert_eq!(
+        f.manager.store.session(s.id).await?.channel_id(),
+        Some("2001")
+    );
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
+    assert_eq!(f.mock.count("turn/start"), 0);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn failed_setups_can_be_dismissed_without_channels_or_repository_claims() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("dismiss-setup", true).await?;
+    api.state.lock().unwrap().fail_next =
+        Some(("POST".into(), "/guilds/7/channels".into(), 403, 50013));
+    assert!(
+        f.manager
+            .create_task(42, 7, "dismiss-setup", "dismiss-setup", "Task")
+            .await
+            .is_err()
+    );
+    let s = f.manager.store.sessions(1).await?.remove(0);
+    assert!(f.manager.finish_task(99, 7, s.id, true).await.is_err());
+    assert!(f.manager.finish_task(42, 7, s.id, false).await.is_err());
+    f.manager.finish_task(42, 7, s.id, true).await?;
+    let dismissed = f.manager.store.session(s.id).await?;
+    assert_eq!(dismissed.channel_state, "dismissed");
+    assert!(dismissed.channel_id().is_none() && dismissed.delete_after.is_none());
+    assert!(
+        !f.manager
+            .store
+            .sessions(100)
+            .await?
+            .iter()
+            .any(|s| s.id == dismissed.id)
+    );
+    f.manager
+        .create_task(42, 7, "retry-setup", "dismiss-setup", "Explicit retry")
+        .await?;
+    assert_eq!(f.mock.count("turn/start"), 1);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn reconnect_commits_live_prompt_routing_even_if_status_delivery_fails() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    let s = f
+        .seed(
+            "prompt-reconnect",
+            100,
+            "preserved-thread",
+            "preserved-turn",
+            false,
+        )
+        .await?;
+    let s = f.text_channel(&s, &api).await?;
+    api.state.lock().unwrap().fail_next = Some(("GET".into(), "/channels/100".into(), 403, 50013));
+    let denied = f.manager.reconnect_channel(42, 7, s.id).await.unwrap_err();
+    assert!(
+        denied
+            .to_string()
+            .contains("get_task_channel: HTTP 403; Discord 50013")
+    );
+    let unchanged = f.manager.store.session(s.id).await?;
+    assert_eq!(unchanged.channel_state, "active");
+    assert_eq!(unchanged.discord_channel_id, s.discord_channel_id);
+    sqlx::query("UPDATE sessions SET channel_state='missing' WHERE id=$1")
+        .bind(s.id)
+        .execute(&f.manager.store.pool)
+        .await?;
+    f.manager.reconnect_channel(42, 7, s.id).await?;
+    assert_eq!(f.manager.store.session(s.id).await?.channel_state, "active");
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        0
+    );
+    f.mock
+        .send(
+            json!({"id":91,"method":"item/tool/requestUserInput","params":{
+        "threadId":"preserved-thread","turnId":"preserved-turn","itemId":"question","isBlocking":true,
+        "questions":[{"id":"choice","header":"Choice","question":"Which option?","options":[]}]}}),
+        )
+        .await;
+    f.status(s.id, "waiting").await?;
+    sqlx::query(
+        "UPDATE discord_outbox SET delivered_at=now(),discord_message_id='700' WHERE session_id=$1",
+    )
+    .bind(s.id)
+    .execute(&f.manager.store.pool)
+    .await?;
+    let replacement = {
+        let mut state = api.state.lock().unwrap();
+        state.channels.remove("100");
+        let replacement = (state.next_id + 1).to_string();
+        state.fail_next = Some((
+            "POST".into(),
+            format!("/channels/{replacement}/messages"),
+            403,
+            50013,
+        ));
+        replacement
+    };
+    assert!(f.manager.reconnect_channel(42, 7, s.id).await.is_err());
+    let restored = f.manager.store.session(s.id).await?;
+    assert_eq!(restored.channel_id(), Some(replacement.as_str()));
+    assert_eq!(restored.codex_thread_id, s.codex_thread_id);
+    assert_eq!(restored.current_turn_id, s.current_turn_id);
+    assert!(restored.repository_claimed && f.manager.store.undelivered(s.id).await?);
+    assert!(
+        restored
+            .discord_error
+            .as_deref()
+            .unwrap()
+            .contains("create_status_message")
+    );
+    f.manager.reconnect_channel(42, 7, s.id).await?;
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
+    assert_eq!(f.mock.count("thread/start"), 0);
+    assert_eq!(f.mock.count("turn/start"), 0);
+    f.manager.stop(42, 7, replacement.parse()?).await?;
+    assert_eq!(f.mock.count("turn/interrupt"), 1);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn unexpected_created_permissions_block_output_and_repeated_creation() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("visibility", true).await?;
+    api.state.lock().unwrap().created_overwrites = Some(json!([
+        {"id":"7","type":0,"allow":"1024","deny":"0"}
+    ]));
+    let error = f
+        .manager
+        .create_task(42, 7, "visibility", "visibility", "Private task")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not retain"));
+    let s = f.manager.store.sessions(1).await?.remove(0);
+    f.manager.reconcile_channels().await?;
+    assert!(f.manager.reconnect_channel(42, 7, s.id).await.is_err());
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/channels/1001/messages"),
+        0
+    );
+    assert_eq!(f.mock.count("thread/start"), 0);
+    // Once an operator restores the exact category policy, adopt the same channel.
+    api.state.lock().unwrap().channels.get_mut("1001").unwrap()["permission_overwrites"] =
+        json!([]);
+    f.manager.reconnect_channel(42, 7, s.id).await?;
+    assert_eq!(
+        f.manager.store.session(s.id).await?.channel_id(),
+        Some("1001")
+    );
+    assert_eq!(
+        api.state
+            .lock()
+            .unwrap()
+            .count("POST", "/guilds/7/channels"),
+        1
+    );
     assert_eq!(f.mock.count("turn/start"), 0);
     f.cleanup().await
 }

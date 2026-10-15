@@ -79,7 +79,9 @@ pub fn definitions() -> Vec<CreateCommand> {
             )
             .add_option(session()),
         CreateCommand::new("dismiss")
-            .description("Dismiss a stopped task and schedule channel cleanup")
+            .description(
+                "Dismiss a stopped task; clean up its text channel or hide its legacy thread",
+            )
             .add_option(session()),
         CreateCommand::new("reconnect")
             .description("Restore a missing task channel without replaying Codex work")
@@ -193,7 +195,7 @@ pub async fn execute(manager: &Manager, c: &CommandInteraction) -> Result<String
             {
                 let active: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE guild_id=$1 AND (repository_claimed OR channel_state IN ('active','provisioning','missing'))")
                     .bind(guild.to_string()).fetch_one(&manager.store.pool).await?;
-                let cleanup: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE guild_id=$1 AND channel_state IN ('completed','dismissed')")
+                let cleanup: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE guild_id=$1 AND channel_kind='text' AND discord_channel_id IS NOT NULL AND channel_state IN ('completed','dismissed')")
                     .bind(guild.to_string()).fetch_one(&manager.store.pool).await?;
                 return Ok(format!(
                     "Active sessions: {active}\nCompleted channels awaiting cleanup: {cleanup}\nRetention: {} hours\nUse /codex to start work and /sessions to find session IDs.",

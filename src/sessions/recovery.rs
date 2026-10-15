@@ -31,8 +31,12 @@ impl Manager {
     async fn recover_one(&self, session: &Session) -> Result<()> {
         let Some(thread) = &session.codex_thread_id else {
             // No turn can have been submitted without first persisting its Codex thread ID.
+            let mut tx = self.store.pool.begin().await?;
             sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,last_outcome='unknown',last_error='Setup was interrupted before task submission',updated_at=now() WHERE id=$1")
-                .bind(session.id).execute(&self.store.pool).await?;
+                .bind(session.id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE inbound_requests SET state='rejected',updated_at=now() WHERE session_id=$1 AND state IN ('received','uncertain')")
+                .bind(session.id).execute(&mut *tx).await?;
+            tx.commit().await?;
             return Ok(());
         };
         let repo: Repository = sqlx::query_as("SELECT id,name,path FROM repositories WHERE id=$1")
