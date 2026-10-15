@@ -18,7 +18,7 @@ Start tasks from `#codex-control`. New channels such as `#fantasyai-implement-pl
 
 Use `/complete` only after the task, validation, and any required integration/deployment are finished. A successful Codex turn alone leaves the task active. `/complete` updates the status, sends a completion notification, and moves the channel to the completed category. `/dismiss` explicitly closes a stopped or failed task. Both schedule deletion after `DISCORD_TASK_RETENTION_HOURS` (default **48**). Replying before deletion reopens the same conversation and cancels cleanup. Failed, waiting, interrupted, and unverified tasks otherwise stay active.
 
-`/sessions` lists channel links and session IDs. From the control channel, use `/status`, `/status session:<id>`, `/stop session:<id>`, `/complete session:<id>`, or `/dismiss session:<id>` without navigating into the task channel. `/reconnect session:<id>` restores a manually deleted task channel without starting or replaying a Codex turn. The control channel receives system errors, not routine task progress. GitHub Issues queues are not implemented in this checkout.
+`/sessions` lists channel links and session IDs. From the control channel, use `/status`, `/status session:<id>`, `/stop session:<id>`, `/complete session:<id>`, or `/dismiss session:<id>` without navigating into the task channel. `/reconnect session:<id>` restores a manually deleted task channel without starting or replaying a Codex turn. The control channel receives system errors, not routine task progress. Use `/queue list repo:<name>` to view the read-only GitHub Issues backlog.
 
 For an idle legacy thread, `/dismiss session:<id>` hides it from `/sessions` while preserving its Discord thread, Codex history, and stored records. It does not schedule deletion. Pending approvals, uncertain input, and queued messages must be resolved first. Replying in the thread restores it to the list and continues the same conversation.
 
@@ -216,3 +216,13 @@ Channel tests also cover naming/collisions, coalesced status edits, completion a
 See [protocol details and supported limitations](docs/protocol.md) before changing the CLI version, approval policy, or restart behavior.
 
 Task channels mention the requester for approvals, structured questions, failures/interruption, explicit task completion/dismissal, and recovery or expired-request notices. Routine progress stays quiet. Only the requester is allowed to be pinged; mentions embedded in model output cannot notify other users or roles.
+
+## GitHub Issues backlog
+
+Install the GitHub CLI (`gh`) on the service PATH. As the service account, run `gh auth login --hostname github.com` and `gh auth status`; grant read access to issues in the intended repositories (including private repositories when needed). The bot reuses that account’s CLI authentication; never submit credentials through Discord. `GH_TOKEN` is also supported by gh when provided securely in the service environment. Discovery does not change GitHub state or start Codex.
+
+Discovery validates `origin` as an HTTPS or SSH github.com URL. For repositories without a suitable origin, use `/repo add name:project github:owner/repository`; this explicit mapping is persisted in the existing repository record and overrides origin. Existing registrations continue to work without a mapping; a missing or unsupported origin produces a queue error. Migration `0004_github_repository.sql` adds the optional mapping column and runs on startup.
+
+Create the `codex-ready` label in each GitHub repository and apply it to open issues intended for the backlog. Issues with any assignee or the `codex-claimed` label are considered claimed and excluded. Pull requests and closed issues are excluded. No scheduler or automatic claiming is included. Issue descriptions returned by the REST API are discarded by gh before the bot parses results and are never passed to Codex; displayed titles are untrusted and sanitized, with mention notifications suppressed.
+
+`/queue list repo:project` returns issue numbers, titles, links and ready status. Large results show a bounded preview with a link to the complete filtered backlog. Discovery follows pages of 100 issues, with per-command and overall timeouts and output limits. Authentication, permission, rate-limit and pagination failures return an error instead of a misleading partial backlog. There are no automatic retries after rate-limit errors; check `gh auth status` and retry after the API limit resets.

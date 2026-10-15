@@ -10,6 +10,7 @@ pub struct Repository {
     pub id: Uuid,
     pub name: String,
     pub path: String,
+    pub github_repository: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -126,7 +127,7 @@ impl Store {
     }
 
     pub async fn repository(&self, name: &str) -> Result<Repository> {
-        sqlx::query_as("SELECT id,name,path FROM repositories WHERE name=$1")
+        sqlx::query_as("SELECT id,name,path,github_repository FROM repositories WHERE name=$1")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?
@@ -134,7 +135,7 @@ impl Store {
     }
     pub async fn repositories(&self) -> Result<Vec<Repository>> {
         Ok(
-            sqlx::query_as("SELECT id,name,path FROM repositories ORDER BY name")
+            sqlx::query_as("SELECT id,name,path,github_repository FROM repositories ORDER BY name")
                 .fetch_all(&self.pool)
                 .await?,
         )

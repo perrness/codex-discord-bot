@@ -29,13 +29,39 @@ pub fn definitions() -> Vec<CreateCommand> {
                     "add",
                     "Register an existing repository",
                 )
-                .add_sub_option(name()),
+                .add_sub_option(name())
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "github",
+                        "Explicit GitHub owner/repository mapping",
+                    )
+                    .max_length(140),
+                ),
             )
             .add_option(CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "list",
                 "List registered repositories",
             )),
+        CreateCommand::new("queue")
+            .description("Read the GitHub Issues backlog")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "list",
+                    "List unclaimed codex-ready issues",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "repo",
+                        "Registered repository",
+                    )
+                    .required(true)
+                    .set_autocomplete(true),
+                ),
+            ),
         CreateCommand::new("project")
             .description("Create a new Git project")
             .add_option(
@@ -96,6 +122,14 @@ pub async fn execute(manager: &Manager, c: &CommandInteraction) -> Result<String
     let guild = manager.authorize(c.user.id.get(), c.guild_id.map(|g| g.get()))?;
     let options = c.data.options();
     match c.data.name.as_str() {
+        "queue" => {
+            let sub = options.first().context("Missing subcommand")?;
+            let ResolvedValue::SubCommand(fields) = &sub.value else {
+                bail!("Invalid subcommand");
+            };
+            anyhow::ensure!(sub.name == "list", "Unknown subcommand");
+            manager.list_queue(string(fields, "repo")?).await
+        }
         "repo" | "project" => {
             let sub = options.first().context("Missing subcommand")?;
             let ResolvedValue::SubCommand(fields) = &sub.value else {
@@ -119,6 +153,13 @@ pub async fn execute(manager: &Manager, c: &CommandInteraction) -> Result<String
                 create || c.data.name == "repo" && sub.name == "add",
                 "Unknown subcommand"
             );
+            let mapping = if fields.iter().any(|o| o.name == "github") {
+                Some(crate::github::GitHubRepository::parse(string(
+                    fields, "github",
+                )?)?)
+            } else {
+                None
+            };
             anyhow::ensure!(
                 manager
                     .store
@@ -130,7 +171,14 @@ pub async fn execute(manager: &Manager, c: &CommandInteraction) -> Result<String
                     .await?,
                 "Command already handled"
             );
-            let result = manager.register_repository(name, create).await;
+            let result = async {
+                let response = manager.register_repository(name, create).await?;
+                if let Some(mapping) = mapping {
+                    manager.set_github_mapping(name, mapping).await?;
+                }
+                Ok(response)
+            }
+            .await;
             manager
                 .store
                 .receipt_state(

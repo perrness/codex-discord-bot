@@ -145,6 +145,35 @@ impl Manager {
         self.client.disconnect();
     }
 
+    pub async fn set_github_mapping(
+        &self,
+        name: &str,
+        mapping: crate::github::GitHubRepository,
+    ) -> Result<()> {
+        let repo = self.store.repository(name).await?;
+        sqlx::query("UPDATE repositories SET github_repository=$2,updated_at=now() WHERE id=$1")
+            .bind(repo.id)
+            .bind(mapping.as_str())
+            .execute(&self.store.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_queue(&self, name: &str) -> Result<String> {
+        let repo = self.store.repository(name).await?;
+        let path = self.root.validate(name).await?;
+        anyhow::ensure!(
+            path.to_str() == Some(repo.path.as_str()),
+            "Repository path changed"
+        );
+        let mapping = match repo.github_repository {
+            Some(value) => crate::github::GitHubRepository::parse(&value)?,
+            None => crate::github::origin(&path).await?,
+        };
+        let issues = crate::github::list(&mapping).await?;
+        Ok(crate::github::render(&mapping, &issues))
+    }
+
     pub async fn register_repository(&self, name: &str, create: bool) -> Result<String> {
         let path = if create {
             self.root.create(name).await?

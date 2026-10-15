@@ -1787,3 +1787,48 @@ async fn unexpected_created_permissions_block_output_and_repeated_creation() -> 
     assert_eq!(f.mock.count("turn/start"), 0);
     f.cleanup().await
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn github_mapping_persists_and_failed_discovery_starts_no_task() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.manager.register_repository("backlog", true).await?;
+    assert!(f.manager.list_queue("backlog").await.is_err());
+    assert!(f.mock.observed.lock().unwrap().is_empty());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+        .fetch_one(&f.manager.store.pool)
+        .await?;
+    assert_eq!(count, 0);
+    f.manager
+        .set_github_mapping(
+            "backlog",
+            codex_discord_bot::github::GitHubRepository::parse("owner/project")?,
+        )
+        .await?;
+    assert_eq!(
+        f.manager
+            .store
+            .repository("backlog")
+            .await?
+            .github_repository
+            .as_deref(),
+        Some("owner/project")
+    );
+    assert_eq!(
+        f.manager.store.repositories().await?[0]
+            .github_repository
+            .as_deref(),
+        Some("owner/project")
+    );
+    f.manager.register_repository("backlog", false).await?;
+    assert_eq!(
+        f.manager
+            .store
+            .repository("backlog")
+            .await?
+            .github_repository
+            .as_deref(),
+        Some("owner/project")
+    );
+    f.cleanup().await
+}

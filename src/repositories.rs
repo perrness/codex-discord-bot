@@ -141,7 +141,7 @@ impl RepositoryRoot {
     }
 }
 
-fn git(path: &Path) -> Command {
+pub(crate) fn git(path: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .env_clear()
