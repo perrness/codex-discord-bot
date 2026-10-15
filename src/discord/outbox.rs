@@ -1,6 +1,6 @@
 use super::render;
 use crate::{persistence::OutboxMessage, sessions::Manager};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serenity::all::*;
 use std::{sync::Arc, time::Duration};
@@ -21,8 +21,15 @@ impl Manager {
             for message in stale {
                 let s = self.store.session(message.session_id).await?;
                 if let (Some(channel), Some(message_id)) =
-                    (s.discord_thread_id, message.discord_message_id)
+                    (s.channel_id(), message.discord_message_id)
                 {
+                    if matches!(s.channel_state.as_str(), "missing" | "deleted") {
+                        sqlx::query("UPDATE discord_outbox SET controls_closed=true WHERE id=$1")
+                            .bind(message.id)
+                            .execute(&self.store.pool)
+                            .await?;
+                        continue;
+                    }
                     let result = tokio::time::timeout(
                         Duration::from_secs(5),
                         ChannelId::new(channel.parse()?).edit_message(
@@ -32,7 +39,15 @@ impl Manager {
                         ),
                     )
                     .await;
-                    if matches!(result, Ok(Ok(_))) {
+                    let closed = match result {
+                        Ok(Ok(_)) => true,
+                        Ok(Err(error)) => matches!(
+                            super::channels::discord_error_code(&error.into()),
+                            Some(10003 | 10008)
+                        ),
+                        Err(_) => false,
+                    };
+                    if closed {
                         sqlx::query("UPDATE discord_outbox SET controls_closed=true WHERE id=$1")
                             .bind(message.id)
                             .execute(&self.store.pool)
@@ -44,10 +59,28 @@ impl Manager {
     }
 
     async fn deliver_one(&self, message: OutboxMessage) -> Result<()> {
+        let gate = self.gate(message.session_id);
+        let _guard = gate.lock().await;
+        // Reopening can supersede a completion notice while this delivery waits for the gate.
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM discord_outbox WHERE id=$1 AND delivered_at IS NULL)",
+        )
+        .bind(message.id)
+        .fetch_one(&self.store.pool)
+        .await?;
+        if !pending {
+            return Ok(());
+        }
         let session = self.store.session(message.session_id).await?;
-        let Some(thread) = session.discord_thread_id else {
+        let Some(thread) = session.channel_id() else {
             return Ok(());
         };
+        if matches!(session.channel_state.as_str(), "missing" | "deleted")
+            || (session.terminal_task()
+                && session.status_revision != session.status_delivered_revision)
+        {
+            return Ok(());
+        }
         let channel = ChannelId::new(thread.parse()?);
         let mut content = message.content.clone();
         let mut mentions = CreateAllowedMentions::new();
@@ -59,8 +92,12 @@ impl Manager {
         let mut builder = CreateMessage::new()
             .content(content)
             .allowed_mentions(mentions)
-            .nonce(Nonce::String(format!("outbox:{}", message.id)))
+            .nonce(render::message_nonce("outbox", channel.get(), message.id))
             .enforce_nonce(true);
+        if let Some(text) = &message.attachment {
+            builder =
+                builder.add_file(CreateAttachment::bytes(text.as_bytes(), "codex-output.txt"));
+        }
         if let Some(id) = message.request_id {
             let mut request = self.store.pending(id).await?;
             if request.generation != self.generation {
@@ -69,17 +106,7 @@ impl Manager {
             builder = builder.components(render::controls(&request));
         }
         let send = async {
-            let metadata = channel
-                .to_channel(&self.http)
-                .await?
-                .guild()
-                .context("Task channel is not a guild thread")?;
-            anyhow::ensure!(
-                metadata.guild_id.to_string() == session.guild_id
-                    && metadata.parent_id.map(|p| p.to_string()).as_deref()
-                        == Some(&session.parent_channel_id),
-                "Task channel moved outside its configured parent"
-            );
+            let metadata = self.task_channel(&session).await?;
             if metadata
                 .thread_metadata
                 .is_some_and(|m| m.archived && !m.locked)

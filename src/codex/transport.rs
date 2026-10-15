@@ -100,6 +100,7 @@ impl Client {
                             method,
                             "turn/started"
                                 | "turn/completed"
+                                | "turn/plan/updated"
                                 | "item/started"
                                 | "item/completed"
                                 | "serverRequest/resolved"

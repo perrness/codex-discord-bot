@@ -5,6 +5,15 @@ use crate::{
 use serde_json::Value;
 use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
 
+// Discord's recent nonce cache is per author. Include the destination so a restored
+// channel cannot receive the cached response for a message sent in its deleted predecessor.
+pub fn message_nonce(kind: &str, channel: u64, key: i64) -> serenity::all::Nonce {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (kind, channel, key).hash(&mut hash);
+    serenity::all::Nonce::String(format!("{kind}:{:016x}", hash.finish()))
+}
+
 /// Discord counts UTF-16 code units. Leave room for formatting and avoid byte slicing.
 pub fn chunks(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
@@ -29,7 +38,21 @@ pub fn chunks(text: &str) -> Vec<String> {
 }
 
 pub fn short(text: &str, limit: usize) -> String {
-    text.chars().take(limit).collect()
+    let mut units = 0;
+    text.chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= limit
+        })
+        .collect()
+}
+
+pub fn truncate(text: &str, limit: usize) -> String {
+    if text.encode_utf16().count() <= limit {
+        text.to_owned()
+    } else {
+        format!("{}…", short(text, limit.saturating_sub(1)))
+    }
 }
 
 /// Keep fenced commands and diffs readable when an interactive preview spans messages.

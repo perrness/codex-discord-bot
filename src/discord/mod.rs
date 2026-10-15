@@ -1,3 +1,4 @@
+pub mod channels;
 mod commands;
 mod outbox;
 pub mod render;
@@ -5,7 +6,7 @@ pub mod render;
 use crate::{codex::protocol::InteractiveParams, sessions::Manager};
 use anyhow::{Context as _, Result, ensure};
 use serenity::all::*;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use uuid::Uuid;
 
 pub struct Handler {
@@ -15,6 +16,7 @@ pub struct Handler {
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, _: Ready) {
+        self.manager.discord_ready.store(false, Ordering::Relaxed);
         let result = match self.manager.config.access.guild {
             Some(id) => {
                 GuildId::new(id)
@@ -25,14 +27,22 @@ impl EventHandler for Handler {
         };
         if result.is_err() {
             tracing::error!("Discord command registration failed; check application permissions");
+            self.manager.system_notice("Discord slash-command registration failed. Check application permissions and service logs.").await;
         } else {
             tracing::info!("Discord connected; commands registered");
+        }
+        if self.manager.reconcile_channels().await.is_err() {
+            self.manager.system_notice("Discord channel reconciliation failed. Each task channel will be checked again before updates or cleanup; Codex execution state is preserved.").await;
         }
         if self.backfill().await.is_err() {
             tracing::warn!(
                 "Could not fetch missed Discord messages; they remain available for the next reconnect"
             );
+            self.manager
+                .fail_closed("Discord catch-up persistence failed");
+            return;
         }
+        self.manager.discord_ready.store(true, Ordering::Relaxed);
     }
 
     async fn message(&self, _: Context, message: Message) {
@@ -144,14 +154,14 @@ impl Handler {
     }
 
     async fn backfill(&self) -> Result<()> {
-        let sessions: Vec<crate::persistence::Session> = sqlx::query_as("SELECT * FROM sessions WHERE discord_thread_id IS NOT NULL AND status <> 'unavailable'")
+        let sessions: Vec<crate::persistence::Session> = sqlx::query_as("SELECT * FROM sessions WHERE COALESCE(discord_channel_id,discord_thread_id) IS NOT NULL AND channel_state NOT IN ('missing','deleted') AND status <> 'unavailable'")
             .fetch_all(&self.manager.store.pool).await?;
         for session in sessions {
-            let channel = ChannelId::new(session.discord_thread_id.as_ref().unwrap().parse()?);
+            let channel = ChannelId::new(session.channel_id().unwrap().parse()?);
             let mut cursor: u64 = session
                 .last_seen_message_id
-                .as_ref()
-                .unwrap_or(session.discord_thread_id.as_ref().unwrap())
+                .as_deref()
+                .unwrap_or(session.channel_id().unwrap())
                 .parse()?;
             // Bound catch-up work, never fetch unrelated channels. Remaining history resumes next connection.
             for _ in 0..10 {

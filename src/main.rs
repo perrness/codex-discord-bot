@@ -61,6 +61,10 @@ async fn main() -> Result<()> {
         server.generation,
         http,
     )?);
+    if let Err(error) = manager.prepare_discord().await {
+        server.shutdown().await;
+        return Err(error.context("Discord category/control configuration failed"));
+    }
     if let Err(error) = manager.recover().await {
         server.shutdown().await;
         return Err(error.context("Session recovery failed"));
@@ -76,6 +80,7 @@ async fn main() -> Result<()> {
     let mut dispatch = tokio::spawn(manager.clone().dispatch(events));
     let mut delivery = tokio::spawn(manager.clone().deliver());
     let mut maintenance = tokio::spawn(manager.clone().maintain());
+    let mut channels = tokio::spawn(manager.clone().maintain_channels());
     let mut gateway = tokio::spawn(async move { discord.start().await });
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tracing::info!("Codex Discord manager started");
@@ -88,6 +93,7 @@ async fn main() -> Result<()> {
         _ = &mut dispatch => { tracing::error!("Codex event dispatch stopped"); false },
         _ = &mut delivery => { tracing::error!("Discord outbox worker stopped; check database connectivity"); false },
         _ = &mut maintenance => { tracing::error!("Database/request maintenance stopped"); false },
+        _ = &mut channels => { tracing::error!("Discord channel maintenance stopped"); false },
         _ = &mut gateway => { tracing::error!("Discord gateway stopped"); false },
         _ = async {
             loop {
@@ -98,10 +104,14 @@ async fn main() -> Result<()> {
     };
     manager.fatal.cancel();
     server.shutdown().await;
+    if !normal {
+        manager.system_notice("A critical bot subsystem stopped. The service is restarting to reconcile sessions; no task or approval will be replayed automatically.").await;
+    }
     shard_manager.shutdown_all().await;
     dispatch.abort();
     delivery.abort();
     maintenance.abort();
+    channels.abort();
     gateway.abort();
     // Claims stay durable until next startup has reconciled history and process cleanup.
     tracing::info!(

@@ -1,5 +1,6 @@
 mod interactive;
 mod recovery;
+mod tasks;
 
 use crate::{
     codex::{Client, RpcError, protocol::*},
@@ -11,14 +12,15 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{FlockOperation, flock};
 use serde_json::{Value, json};
-use serenity::all::{
-    ChannelId, ChannelType, CreateAllowedMentions, CreateMessage, CreateThread, Http, Nonce,
-};
+use serenity::all::Http;
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -32,6 +34,11 @@ pub struct Manager {
     pub generation: Uuid,
     pub http: Arc<Http>,
     pub fatal: CancellationToken,
+    pub(crate) control_channel: AtomicU64,
+    pub(crate) discord_guild: AtomicU64,
+    pub(crate) bot_user: AtomicU64,
+    pub(crate) discord_ready: AtomicBool,
+    pub(crate) provisioning_gate: AsyncMutex<()>,
     root: RepositoryRoot,
     gates: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
     repository_locks: Mutex<HashMap<Uuid, (Uuid, File)>>,
@@ -50,6 +57,8 @@ impl Manager {
     ) -> Result<Self> {
         let root = RepositoryRoot::open(&config.repos_root)?;
         std::fs::create_dir_all(config.state_dir.join("locks"))?;
+        let control_channel = AtomicU64::new(config.channel_id);
+        let discord_guild = AtomicU64::new(config.access.guild.unwrap_or(0));
         Ok(Self {
             config,
             store,
@@ -58,6 +67,11 @@ impl Manager {
             http,
             root,
             fatal: CancellationToken::new(),
+            control_channel,
+            discord_guild,
+            bot_user: AtomicU64::new(0),
+            discord_ready: AtomicBool::new(false),
+            provisioning_gate: AsyncMutex::new(()),
             gates: Mutex::new(HashMap::new()),
             repository_locks: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
@@ -67,13 +81,15 @@ impl Manager {
 
     pub fn authorize(&self, user: u64, guild: Option<u64>) -> Result<u64> {
         ensure!(
-            self.config.access.allows(user, guild, false),
+            self.config.access.allows(user, guild, false)
+                && (self.discord_guild.load(Ordering::Relaxed) == 0
+                    || guild == Some(self.discord_guild.load(Ordering::Relaxed))),
             "Not authorized"
         );
         Ok(guild.unwrap())
     }
 
-    fn gate(&self, session: Uuid) -> Arc<AsyncMutex<()>> {
+    pub(crate) fn gate(&self, session: Uuid) -> Arc<AsyncMutex<()>> {
         self.gates
             .lock()
             .unwrap()
@@ -164,50 +180,23 @@ impl Manager {
         );
         let session = self
             .store
-            .reserve(&repo, user, guild, self.config.channel_id, source)
+            .reserve(
+                &repo,
+                user,
+                guild,
+                self.control_channel.load(Ordering::Relaxed),
+                source,
+            )
             .await?;
         let gate = self.gate(session.id);
         let _guard = gate.lock().await;
         let result = async {
             self.take_repository_lock(&repo, session.id)?;
-            let parent = ChannelId::new(self.config.channel_id);
-            let channel = parent
-                .to_channel(&self.http)
-                .await?
-                .guild()
-                .context("Task channel must belong to a guild")?;
-            ensure!(
-                channel.guild_id.get() == guild && channel.kind == ChannelType::Text,
-                "Task channel must be a text channel in this guild"
-            );
-            let starter = parent
-                .send_message(
-                    &self.http,
-                    CreateMessage::new()
-                        .content(format!(
-                            "**{}** · {}\nTask `{}`",
-                            name,
-                            render::short(task, 400),
-                            session.id
-                        ))
-                        .allowed_mentions(CreateAllowedMentions::new())
-                        .nonce(Nonce::String(source.into()))
-                        .enforce_nonce(true),
-                )
-                .await?;
-            // Discord's message-thread ID equals the starter message ID. Persist before creation.
-            sqlx::query("UPDATE sessions SET discord_thread_id=$2,updated_at=now() WHERE id=$1")
-                .bind(session.id)
-                .bind(starter.id.to_string())
-                .execute(&self.store.pool)
-                .await?;
-            parent
-                .create_thread_from_message(
-                    &self.http,
-                    starter.id,
-                    CreateThread::new(render::short(&format!("{name} · {task}"), 100)),
-                )
-                .await?;
+            sqlx::query("UPDATE sessions SET channel_kind='text',channel_state='provisioning',task_title=$2 WHERE id=$1")
+                .bind(session.id).bind(render::truncate(task, 500)).execute(&self.store.pool).await?;
+            let session = self.store.session(session.id).await?;
+            let channel = self.provision_channel(&session, name).await?;
+            self.sync_status(&self.store.session(session.id).await?).await?;
             let codex = self
                 .client
                 .start_thread(
@@ -223,7 +212,7 @@ impl Manager {
                 .await?;
             let session = self.store.session(session.id).await?;
             self.submit_turn(&session, source, task).await?;
-            Ok(format!("Started in <#{}>.", starter.id))
+            Ok(format!("Started in <#{channel}>."))
         }
         .await;
         if result.is_err() {
@@ -250,7 +239,7 @@ impl Manager {
         .bind(source)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE sessions SET status='running',repository_claimed=true,current_turn_id=NULL,last_error=NULL,updated_at=now() WHERE id=$1")
+        sqlx::query("UPDATE sessions SET status='running',repository_claimed=true,current_turn_id=NULL,last_error=NULL,status_snapshot='{}',updated_at=now() WHERE id=$1")
             .bind(session.id).execute(&mut *tx).await?;
         tx.commit().await?;
         let turn = match self
@@ -273,11 +262,7 @@ impl Manager {
                 );
             }
         };
-        if let Some(channel) = session
-            .discord_thread_id
-            .as_ref()
-            .and_then(|s| s.parse().ok())
-        {
+        if let Some(channel) = session.channel_id().and_then(|s| s.parse().ok()) {
             self.live
                 .lock()
                 .unwrap()
@@ -295,14 +280,6 @@ impl Manager {
             )
             .bind(source)
             .execute(&mut *tx)
-            .await?;
-            persistence::enqueue(
-                &mut tx,
-                session.id,
-                &format!("{}:started", turn.id),
-                "Working on your request…",
-                None,
-            )
             .await?;
             tx.commit().await?;
             Ok::<_, anyhow::Error>(())
@@ -327,11 +304,16 @@ impl Manager {
             .store
             .by_discord(channel)
             .await?
-            .context("This is not a Codex task thread")?;
+            .context("This is not a Codex task channel")?;
         ensure!(session.guild_id == guild.to_string(), "Wrong guild");
         let gate = self.gate(session.id);
         let _guard = gate.lock().await;
         let session = self.store.session(session.id).await?;
+        ensure!(
+            session.channel_id() == Some(channel.to_string().as_str())
+                && !matches!(session.channel_state.as_str(), "missing" | "deleted"),
+            "This task channel is unavailable; use /reconnect from the control channel"
+        );
         ensure!(
             !text.trim().is_empty() && text.len() <= 32000,
             "Send a text message of 1–32000 bytes"
@@ -343,13 +325,26 @@ impl Manager {
             "Message already handled"
         );
         let result = self.followup_locked(&session, source, text).await;
-        if result.is_err() {
+        if let Err(error) = &result {
             sqlx::query("UPDATE inbound_requests SET state='rejected',updated_at=now() WHERE discord_id=$1 AND state='received'").bind(source).execute(&self.store.pool).await?;
+            self.store
+                .activity(session.id, &format!("Could not continue: {error}"))
+                .await?;
         }
         result
     }
 
     async fn followup_locked(&self, session: &Session, source: &str, text: &str) -> Result<()> {
+        if session.terminal_task() {
+            // An authorized follow-up cancels retention even if resuming is blocked by another
+            // repository owner or an unavailable Codex history.
+            let mut tx = self.store.pool.begin().await?;
+            sqlx::query("UPDATE sessions SET channel_state='active',completed_at=NULL,delete_after=NULL WHERE id=$1")
+                .bind(session.id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM discord_outbox WHERE session_id=$1 AND delivered_at IS NULL AND (dedupe_key LIKE 'task-completed:%' OR dedupe_key LIKE 'task-dismissed:%')")
+                .bind(session.id).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
         let thread = session
             .codex_thread_id
             .as_deref()
@@ -381,12 +376,7 @@ impl Manager {
                     }
                 }
                 self.store
-                    .enqueue(
-                        session.id,
-                        &format!("input:{source}"),
-                        "Your message was sent to the running turn.",
-                        None,
-                    )
+                    .activity(session.id, "Follow-up sent to the running turn")
                     .await?;
             }
             "idle" => {
@@ -457,7 +447,7 @@ impl Manager {
                 self.fail_closed("interrupt could not be confirmed");
                 bail!("Interrupt failed; restarting the service to stop its processes");
             }
-            let _ = sqlx::query("UPDATE sessions SET status='stopping',updated_at=now() WHERE discord_thread_id=$1 AND current_turn_id=$2 AND repository_claimed")
+            let _ = sqlx::query("UPDATE sessions SET status='stopping',updated_at=now() WHERE COALESCE(discord_channel_id,discord_thread_id)=$1 AND current_turn_id=$2 AND repository_claimed")
                 .bind(channel.to_string()).bind(turn).execute(&self.store.pool).await;
             return Ok("Interruption requested. Waiting for Codex to stop.".into());
         }
@@ -465,13 +455,13 @@ impl Manager {
             .store
             .by_discord(channel)
             .await?
-            .context("Use /stop inside a task thread")?;
+            .context("Use /stop inside a task channel, or supply a session ID")?;
         ensure!(session.guild_id == guild.to_string(), "Wrong guild");
         ensure!(
             !session.repository_claimed,
             "Session is starting or recovering; wait for its status update"
         );
-        Ok("There is no running turn in this thread.".into())
+        Ok("There is no running turn in this channel.".into())
     }
 
     pub async fn dispatch(self: Arc<Self>, mut events: mpsc::Receiver<Event>) -> Result<()> {
@@ -551,22 +541,20 @@ impl Manager {
                         .unwrap()
                         .insert((e.thread_id, item_id), e.item);
                 } else if method == "item/completed" {
-                    if (e.item["type"] == "agentMessage" || e.item["type"] == "plan")
-                        && let Some(text) = e.item["text"].as_str().filter(|s| !s.is_empty())
-                    {
-                        self.store
-                            .enqueue(
-                                session.id,
-                                &format!("{}:{}", e.turn_id, item_id),
-                                text,
-                                None,
-                            )
-                            .await?;
-                    }
+                    self.present_item(&session, &e.turn_id, &e.item).await?;
                     self.previews
                         .lock()
                         .unwrap()
                         .remove(&(e.thread_id, item_id));
+                }
+            }
+            "turn/plan/updated" => {
+                if session.current_turn_id.is_some()
+                    && params["turnId"].as_str() == session.current_turn_id.as_deref()
+                {
+                    let plan = crate::discord::channels::reported_plan(&params["plan"]);
+                    sqlx::query("UPDATE sessions SET status_snapshot=jsonb_set(status_snapshot,'{plan}',$2),updated_at=now() WHERE id=$1")
+                        .bind(session.id).bind(plan).execute(&self.store.pool).await?;
                 }
             }
             "turn/completed" => {
@@ -580,22 +568,27 @@ impl Manager {
                     .outcome()
                     .context("Completion event was not terminal")?;
                 self.client.clean_terminals(&e.thread_id).await?;
+                self.deliver_response(&session, &e.turn.id).await?;
                 let mut tx = self.store.pool.begin().await?;
                 sqlx::query("UPDATE sessions SET status='idle',repository_claimed=false,current_turn_id=NULL,last_outcome=$2,last_error=$3,updated_at=now() WHERE id=$1")
                     .bind(session.id).bind(outcome).bind(if outcome == "failed" { Some("Codex turn failed; check the task output and service logs") } else { None }).execute(&mut *tx).await?;
                 sqlx::query("UPDATE pending_requests SET state='expired',updated_at=now() WHERE session_id=$1 AND state IN ('pending','responding')")
                     .bind(session.id).execute(&mut *tx).await?;
-                persistence::enqueue(
-                    &mut tx,
-                    session.id,
-                    &format!("{}:terminal", e.turn.id),
-                    &format!("Turn **{outcome}**. Reply here to continue."),
-                    None,
-                )
-                .await?;
+                if outcome != "completed" {
+                    persistence::enqueue(
+                        &mut tx,
+                        session.id,
+                        &format!("{}:terminal", e.turn.id),
+                        &format!(
+                            "Turn **{outcome}**. This task stays active; reply here to continue."
+                        ),
+                        None,
+                    )
+                    .await?;
+                }
                 tx.commit().await?;
                 self.drop_repository_lock(&session);
-                if let Some(channel) = session.discord_thread_id.and_then(|v| v.parse().ok()) {
+                if let Some(channel) = session.channel_id().and_then(|v| v.parse().ok()) {
                     self.live.lock().unwrap().remove(&channel);
                 }
                 self.previews
@@ -612,21 +605,56 @@ impl Manager {
             "error" => {
                 let e: ErrorEvent = serde_json::from_value(params)?;
                 if session.current_turn_id.as_deref() == Some(&e.turn_id) {
-                    self.store
-                        .enqueue(
-                            session.id,
-                            &format!("{}:error:{}", e.turn_id, e.will_retry),
-                            if e.will_retry {
-                                "Codex encountered an error and is retrying the model connection."
-                            } else {
-                                "Codex reported an error. Waiting for the final turn status."
-                            },
-                            None,
-                        )
-                        .await?;
+                    let text = if e.will_retry {
+                        "Codex is retrying the model connection"
+                    } else {
+                        "Codex reported an error; waiting for the final turn status"
+                    };
+                    self.store.activity(session.id, text).await?;
+                    if !e.will_retry {
+                        self.store
+                            .enqueue(session.id, &format!("failure:{}", e.turn_id), text, None)
+                            .await?;
+                    }
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn present_item(&self, session: &Session, turn: &str, item: &Value) -> Result<()> {
+        let Some(text) = item["text"].as_str().filter(|s| !s.is_empty()) else {
+            return Ok(());
+        };
+        match item["type"].as_str() {
+            Some("plan") => self.store.activity(session.id, text).await?,
+            Some("agentMessage") => {
+                self.store.activity(session.id, text).await?;
+                if item["phase"] != "commentary" {
+                    let snapshot = json!({"response":render::truncate(text, 60000),"response_key":format!("{turn}:{}", item["id"].as_str().unwrap_or("answer"))});
+                    sqlx::query("UPDATE sessions SET status_snapshot=status_snapshot || $2,updated_at=now() WHERE id=$1")
+                        .bind(session.id).bind(snapshot).execute(&self.store.pool).await?;
+                    // Explicit answers/questions are conversational output, not progress chatter.
+                    // Models without phase metadata are coalesced until the turn ends.
+                    if item["phase"] == "final_answer" {
+                        self.deliver_response(&self.store.session(session.id).await?, turn)
+                            .await?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn deliver_response(&self, session: &Session, turn: &str) -> Result<()> {
+        if let (Some(key), Some(text)) = (
+            session.status_snapshot["response_key"].as_str(),
+            session.status_snapshot["response"].as_str(),
+        ) && key.starts_with(&format!("{turn}:"))
+        {
+            self.store.enqueue(session.id, key, text, None).await?;
         }
         Ok(())
     }

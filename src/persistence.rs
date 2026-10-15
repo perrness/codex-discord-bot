@@ -20,6 +20,18 @@ pub struct Session {
     pub guild_id: String,
     pub parent_channel_id: String,
     pub discord_thread_id: Option<String>,
+    pub discord_channel_id: Option<String>,
+    pub channel_kind: String,
+    pub channel_state: String,
+    pub task_title: String,
+    pub status_message_id: Option<String>,
+    pub status_snapshot: Value,
+    pub status_revision: i64,
+    pub status_delivered_revision: i64,
+    pub discord_failures: i32,
+    pub discord_error: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub delete_after: Option<DateTime<Utc>>,
     pub codex_thread_id: Option<String>,
     pub working_directory: String,
     pub status: String,
@@ -29,6 +41,34 @@ pub struct Session {
     pub last_error: Option<String>,
     pub last_seen_message_id: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Session {
+    pub fn channel_id(&self) -> Option<&str> {
+        self.discord_channel_id
+            .as_deref()
+            .or(self.discord_thread_id.as_deref())
+    }
+
+    pub fn terminal_task(&self) -> bool {
+        matches!(self.channel_state.as_str(), "completed" | "dismissed")
+    }
+
+    pub fn cleanup_due(&self, now: DateTime<Utc>, control: u64) -> bool {
+        self.channel_kind == "text"
+            && self.terminal_task()
+            && self
+                .channel_id()
+                .is_some_and(|id| id != control.to_string() && id != self.parent_channel_id)
+            && !self.repository_claimed
+            && self.current_turn_id.is_none()
+            && matches!(self.status.as_str(), "idle" | "unavailable")
+            && (self.codex_thread_id.is_some() || self.channel_state == "dismissed")
+            && self.completed_at.is_some()
+            && self.delete_after.is_some_and(|date| date <= now)
+            && self.status_message_id.is_some()
+            && self.status_delivered_revision == self.status_revision
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -53,6 +93,7 @@ pub struct OutboxMessage {
     pub request_id: Option<Uuid>,
     pub discord_message_id: Option<String>,
     pub attempts: i32,
+    pub attachment: Option<String>,
 }
 
 #[derive(Clone)]
@@ -121,7 +162,7 @@ impl Store {
     }
     pub async fn by_discord(&self, thread: u64) -> Result<Option<Session>> {
         Ok(
-            sqlx::query_as("SELECT * FROM sessions WHERE discord_thread_id=$1")
+            sqlx::query_as("SELECT * FROM sessions WHERE COALESCE(discord_channel_id,discord_thread_id)=$1 AND channel_state <> 'deleted'")
                 .bind(thread.to_string())
                 .fetch_optional(&self.pool)
                 .await?,
@@ -192,6 +233,21 @@ impl Store {
             .await?
             .context("Interactive request no longer exists")
     }
+    pub async fn activity(&self, id: Uuid, text: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET status_snapshot=jsonb_set(status_snapshot,'{activity}',to_jsonb($2::text)),updated_at=now() WHERE id=$1")
+            .bind(id).bind(crate::discord::render::truncate(text, 300)).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn unresolved(&self, id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pending_requests WHERE session_id=$1 AND state IN ('pending','responding')) OR EXISTS(SELECT 1 FROM inbound_requests WHERE session_id=$1 AND state IN ('received','sending','uncertain'))")
+            .bind(id).fetch_one(&self.pool).await?)
+    }
+
+    pub async fn undelivered(&self, id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discord_outbox WHERE session_id=$1 AND delivered_at IS NULL)")
+            .bind(id).fetch_one(&self.pool).await?)
+    }
     pub async fn enqueue(
         &self,
         session: Uuid,
@@ -205,7 +261,7 @@ impl Store {
         Ok(())
     }
     pub async fn outbox(&self) -> Result<Vec<OutboxMessage>> {
-        Ok(sqlx::query_as("SELECT o.* FROM discord_outbox o WHERE delivered_at IS NULL AND next_attempt_at<=now() AND NOT EXISTS (SELECT 1 FROM discord_outbox earlier WHERE earlier.session_id=o.session_id AND earlier.id<o.id AND earlier.delivered_at IS NULL) ORDER BY id LIMIT 20")
+        Ok(sqlx::query_as("SELECT o.* FROM discord_outbox o JOIN sessions s ON s.id=o.session_id WHERE o.delivered_at IS NULL AND o.next_attempt_at<=now() AND s.channel_state NOT IN ('missing','deleted') AND COALESCE(s.discord_channel_id,s.discord_thread_id) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM discord_outbox earlier WHERE earlier.session_id=o.session_id AND earlier.id<o.id AND earlier.delivered_at IS NULL) ORDER BY o.id LIMIT 20")
             .fetch_all(&self.pool).await?)
     }
 }
@@ -217,16 +273,19 @@ pub async fn enqueue(
     content: &str,
     request: Option<Uuid>,
 ) -> Result<()> {
-    let chunks = if request.is_some() {
-        crate::discord::render::interactive_chunks(content)
+    let (chunks, attachment) = if request.is_some() {
+        (crate::discord::render::interactive_chunks(content), None)
     } else {
-        crate::discord::render::chunks(content)
+        let preview = crate::discord::render::truncate(content, 1700);
+        let attachment = (preview != content).then(|| content.to_owned());
+        (vec![preview], attachment)
     };
     let last = chunks.len().saturating_sub(1);
     let notify_requester = needs_attention(key, request.is_some());
     for (index, chunk) in chunks.into_iter().enumerate() {
-        sqlx::query("INSERT INTO discord_outbox(dedupe_key,session_id,content,request_id,notify_requester) VALUES($1,$2,$3,$4,$5) ON CONFLICT(dedupe_key) DO NOTHING")
+        sqlx::query("INSERT INTO discord_outbox(dedupe_key,session_id,content,request_id,notify_requester,attachment) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(dedupe_key) DO NOTHING")
             .bind(format!("{key}:{index}")).bind(session).bind(chunk).bind(if index == last { request } else { None }).bind(notify_requester && index == last)
+            .bind(&attachment)
             .execute(&mut *conn).await?;
     }
     Ok(())
@@ -236,9 +295,17 @@ pub async fn enqueue(
 fn needs_attention(key: &str, interactive: bool) -> bool {
     interactive
         || key.ends_with(":terminal")
-        || ["recovery:", "recovered:", "expired:"]
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
+        || [
+            "recovery:",
+            "recovered:",
+            "expired:",
+            "task-completed:",
+            "task-dismissed:",
+            "failure:",
+            "question:",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 #[cfg(test)]

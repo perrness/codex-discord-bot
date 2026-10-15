@@ -272,8 +272,9 @@ fn validate_request(
     ensure!(
         r.session_id == s.id
             && s.guild_id == guild.to_string()
-            && s.discord_thread_id.as_deref() == Some(channel.to_string().as_str()),
-        "Request belongs to a different thread"
+            && s.channel_id() == Some(channel.to_string().as_str())
+            && !matches!(s.channel_state.as_str(), "deleted" | "missing"),
+        "Request belongs to a different or unavailable channel"
     );
     ensure!(
         s.current_turn_id.as_deref() == Some(r.turn_id.as_str())

@@ -45,6 +45,9 @@ pub struct Config {
     pub discord_token: String,
     pub access: Access,
     pub channel_id: u64,
+    pub active_category_id: u64,
+    pub completed_category_id: u64,
+    pub channel_retention: Duration,
     pub repos_root: PathBuf,
     pub state_dir: PathBuf,
     pub codex_bin: PathBuf,
@@ -117,9 +120,19 @@ impl Config {
             database_url: required("DATABASE_URL")?,
             discord_token: required("DISCORD_TOKEN")?,
             access: Access { users, guild },
-            channel_id: required("DISCORD_CHANNEL_ID")?
+            // Preserve the old control-channel setting during upgrades. Zero means discover/create.
+            channel_id: optional_id("DISCORD_CONTROL_CHANNEL_ID")?
+                .or(optional_id("DISCORD_CHANNEL_ID")?)
+                .unwrap_or(0),
+            active_category_id: required("DISCORD_ACTIVE_CATEGORY_ID")?
                 .parse()
-                .context("Invalid channel ID")?,
+                .context("Invalid active category ID")?,
+            completed_category_id: required("DISCORD_COMPLETED_CATEGORY_ID")?
+                .parse()
+                .context("Invalid completed category ID")?,
+            channel_retention: retention(
+                &env::var("DISCORD_TASK_RETENTION_HOURS").unwrap_or_else(|_| "48".into()),
+            )?,
             repos_root: path("REPOS_ROOT", Some("/repos"))?,
             state_dir: path("STATE_DIR", Some("/var/lib/codex-discord-bot"))?,
             codex_bin: path("CODEX_BIN", None)?,
@@ -133,7 +146,12 @@ impl Config {
             },
             rpc_timeout: Duration::from_secs(30),
         };
-        ensure!(config.channel_id != 0, "Invalid channel ID");
+        ensure!(
+            config.active_category_id != 0
+                && config.completed_category_id != 0
+                && config.active_category_id != config.completed_category_id,
+            "Configure distinct, nonzero active and completed category IDs"
+        );
         ensure!(
             !config.codex_home.starts_with(&config.repos_root),
             "CODEX_HOME must be outside repositories"
@@ -144,6 +162,30 @@ impl Config {
         );
         Ok(config)
     }
+}
+
+fn optional_id(name: &str) -> Result<Option<u64>> {
+    let value = env::var(name).ok().filter(|v| !v.is_empty());
+    value
+        .map(|v| {
+            let id = v
+                .parse::<u64>()
+                .with_context(|| format!("Invalid {name}"))?;
+            ensure!(id != 0, "Invalid {name}");
+            Ok(id)
+        })
+        .transpose()
+}
+
+fn retention(value: &str) -> Result<Duration> {
+    let hours: u64 = value
+        .parse()
+        .context("Invalid DISCORD_TASK_RETENTION_HOURS")?;
+    ensure!(
+        (1..=87600).contains(&hours),
+        "Retention must be 1–87600 hours"
+    );
+    Ok(Duration::from_secs(hours * 3600))
 }
 
 pub fn required(key: &str) -> Result<String> {
@@ -214,6 +256,9 @@ mod tests {
                 guild: Some(7),
             },
             channel_id: 8,
+            active_category_id: 9,
+            completed_category_id: 10,
+            channel_retention: Duration::from_secs(48 * 3600),
             repos_root: root.clone(),
             state_dir: temp.path().join("state"),
             codex_home: temp.path().join("codex"),
@@ -230,5 +275,13 @@ mod tests {
         assert!(config.prepare_directories().is_err());
         config.codex_home = root.join("credentials");
         assert!(config.prepare_directories().is_err());
+    }
+
+    #[test]
+    fn retention_is_bounded_and_defaults_to_two_days() {
+        assert_eq!(retention("48").unwrap(), Duration::from_secs(172800));
+        for value in ["0", "-1", "forever", "87601"] {
+            assert!(retention(value).is_err());
+        }
     }
 }

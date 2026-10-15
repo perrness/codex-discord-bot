@@ -19,7 +19,7 @@ impl Manager {
                 // Keep the claim: lack of evidence must never authorize a second writer.
                 sqlx::query("UPDATE sessions SET status='unavailable',last_outcome='unknown',last_error='Recovery could not verify conversation or process state; inspect with SSH',updated_at=now() WHERE id=$1")
                     .bind(s.id).execute(&self.store.pool).await?;
-                if s.discord_thread_id.is_some() {
+                if s.channel_id().is_some() {
                     self.store.enqueue(s.id, &format!("recovery:{}:{}", self.generation, s.id),
                         "Recovery could not verify this session. The repository remains reserved. Inspect the service logs and Codex history over SSH; no work was replayed.", None).await?;
                 }
@@ -74,21 +74,24 @@ impl Manager {
             .and_then(|v| v["status"].as_str())
             .filter(|s| matches!(*s, "completed" | "failed" | "interrupted"))
             .unwrap_or("unknown");
-        if let Some(turn) = latest
+        if let Some(turn) =
+            latest.filter(|v| v["id"].as_str() == session.current_turn_id.as_deref())
             && let Some(items) = turn["items"].as_array()
         {
             for item in items {
                 if item["type"] == "agentMessage"
-                    && let (Some(turn_id), Some(item_id), Some(text)) = (
+                    && let (Some(turn_id), Some(_item_id), Some(_text)) = (
                         turn["id"].as_str(),
                         item["id"].as_str(),
                         item["text"].as_str(),
                     )
                 {
-                    self.store
-                        .enqueue(session.id, &format!("{turn_id}:{item_id}"), text, None)
-                        .await?;
+                    self.present_item(session, turn_id, item).await?;
                 }
+            }
+            if let Some(turn_id) = turn["id"].as_str() {
+                self.deliver_response(&self.store.session(session.id).await?, turn_id)
+                    .await?;
             }
         }
         let mut tx = self.store.pool.begin().await?;
