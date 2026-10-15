@@ -4,6 +4,41 @@ use anyhow::{Context, Result, ensure};
 
 pub const SUPPORTED_CODEX_VERSION: &str = "0.162.1";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalsReviewer {
+    #[default]
+    AutoReview,
+    User,
+}
+
+impl ApprovalsReviewer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoReview => "auto_review",
+            Self::User => "user",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoReview => "Approve for me",
+            Self::User => "Ask for approval",
+        }
+    }
+}
+
+impl std::str::FromStr for ApprovalsReviewer {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto_review" => Ok(Self::AutoReview),
+            "user" => Ok(Self::User),
+            _ => anyhow::bail!("CODEX_APPROVALS_REVIEWER must be auto_review or user"),
+        }
+    }
+}
+
 // Deliberately not Debug: this object contains secrets.
 pub struct Config {
     pub database_url: String,
@@ -16,6 +51,7 @@ pub struct Config {
     pub codex_home: PathBuf,
     pub tool_path: String,
     pub model: Option<String>,
+    pub approvals_reviewer: ApprovalsReviewer,
     pub rpc_timeout: Duration,
 }
 
@@ -90,6 +126,11 @@ impl Config {
             codex_home: path("CODEX_HOME", None)?,
             tool_path: required("TOOL_PATH")?,
             model: env::var("CODEX_MODEL").ok().filter(|v| !v.is_empty()),
+            approvals_reviewer: match env::var("CODEX_APPROVALS_REVIEWER") {
+                Ok(value) => value.parse()?,
+                Err(env::VarError::NotPresent) => ApprovalsReviewer::default(),
+                Err(error) => return Err(error).context("Invalid CODEX_APPROVALS_REVIEWER"),
+            },
             rpc_timeout: Duration::from_secs(30),
         };
         ensure!(config.channel_id != 0, "Invalid channel ID");
@@ -130,6 +171,23 @@ fn path(key: &str, default: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewer_defaults_to_auto_review_and_rejects_unknown_modes() {
+        assert_eq!(ApprovalsReviewer::default(), ApprovalsReviewer::AutoReview);
+        assert_eq!(
+            "auto_review".parse::<ApprovalsReviewer>().unwrap(),
+            ApprovalsReviewer::AutoReview
+        );
+        assert_eq!(
+            "user".parse::<ApprovalsReviewer>().unwrap(),
+            ApprovalsReviewer::User
+        );
+        for value in ["", "never", "allow", "auto", "USER"] {
+            assert!(value.parse::<ApprovalsReviewer>().is_err());
+        }
+    }
+
     #[test]
     fn authorization_checks_all_entry_contexts() {
         let access = Access {
@@ -162,6 +220,7 @@ mod tests {
             codex_bin: "/unused".into(),
             tool_path: "/usr/bin:/bin".into(),
             model: None,
+            approvals_reviewer: ApprovalsReviewer::default(),
             rpc_timeout: Duration::from_secs(1),
         };
         config.prepare_directories().unwrap();

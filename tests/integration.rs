@@ -60,7 +60,7 @@ impl Mock {
                 let result = match method {
                     "thread/resume" => {
                         json!({"thread":{"id":p["threadId"],"cwd":p["cwd"],"status":{"type":"idle"}},
-                        "cwd":p["cwd"],"approvalPolicy":"on-request","approvalsReviewer":"user",
+                        "cwd":p["cwd"],"approvalPolicy":"on-request","approvalsReviewer":p["approvalsReviewer"],
                         "sandbox":{"type":"workspaceWrite","networkAccess":false,"writableRoots":[]}})
                     }
                     "thread/backgroundTerminals/clean" | "turn/interrupt" => json!({}),
@@ -159,6 +159,7 @@ impl Fixture {
             codex_bin: "/not-used".into(),
             tool_path: "/usr/bin:/bin".into(),
             model: None,
+            approvals_reviewer: Default::default(),
             rpc_timeout: Duration::from_secs(1),
         });
         let (mock, client, events) = Mock::new();
@@ -326,6 +327,29 @@ async fn interleaved_events_and_approvals_stay_in_their_sessions() -> Result<()>
     let mapped: HashMap<_, _> = rows.into_iter().collect();
     assert_eq!(mapped[&a.id], "Alpha result");
     assert_eq!(mapped[&b.id], "Beta result");
+    let notifications: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT dedupe_key,notify_requester FROM discord_outbox WHERE session_id=$1 OR session_id=$2",
+    )
+    .bind(a.id)
+    .bind(b.id)
+    .fetch_all(&f.manager.store.pool)
+    .await?;
+    assert!(
+        notifications
+            .iter()
+            .any(|(key, notify)| key == "turn-a:terminal:0" && *notify)
+    );
+    assert!(
+        notifications
+            .iter()
+            .any(|(key, notify)| key.starts_with("request:") && *notify)
+    );
+    for (key, notify) in &notifications {
+        if key.ends_with(":started:0") || key.ends_with(":same-item-id:0") {
+            assert!(!notify, "Progress notification: {key}");
+        }
+    }
+
     let replies: Vec<_> = f
         .mock
         .observed

@@ -1,6 +1,9 @@
 //! Opt-in contract check against the pinned installed CLI. No authentication or model turn.
 use anyhow::{Context, Result, ensure};
-use codex_discord_bot::{codex::Client, config::SUPPORTED_CODEX_VERSION};
+use codex_discord_bot::{
+    codex::Client,
+    config::{ApprovalsReviewer, SUPPORTED_CODEX_VERSION},
+};
 use serde_json::{Value, json};
 use std::{process::Stdio, time::Duration};
 use tokio::process::Command;
@@ -15,6 +18,13 @@ async fn installed_codex_negotiates_and_applies_safe_thread_policy() -> Result<(
             == format!("codex-cli {SUPPORTED_CODEX_VERSION}"),
         "Wrong Codex version"
     );
+    for reviewer in [ApprovalsReviewer::AutoReview, ApprovalsReviewer::User] {
+        check_thread_policy(&binary, reviewer).await?;
+    }
+    Ok(())
+}
+
+async fn check_thread_policy(binary: &str, reviewer: ApprovalsReviewer) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let home = directory.path().join("codex");
     let repo = directory.path().join("project");
@@ -36,14 +46,14 @@ async fn installed_codex_negotiates_and_applies_safe_thread_policy() -> Result<(
             "-c",
             "approval_policy=\"on-request\"",
             "-c",
-            "approvals_reviewer=\"user\"",
-            "-c",
             "sandbox_mode=\"workspace-write\"",
             "-c",
             "sandbox_workspace_write.network_access=false",
             "-c",
             "sandbox_workspace_write.writable_roots=[]",
         ])
+        .arg("-c")
+        .arg(format!("approvals_reviewer=\"{}\"", reviewer.as_str()))
         .current_dir(&repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -61,8 +71,8 @@ async fn installed_codex_negotiates_and_applies_safe_thread_policy() -> Result<(
         client.notify("initialized", json!({})).await?;
         let auth: Value = client.request("account/read", json!({"refreshToken":false})).await?;
         ensure!(auth["account"].is_null(), "Test unexpectedly accessed credentials");
-        // start_thread verifies the effective cwd, sandbox, network access and human reviewer.
-        let thread = client.start_thread(repo.to_str().unwrap(), None).await?;
+        // Verify both reviewers with the same effective cwd, sandbox and network restrictions.
+        let thread = client.start_thread(repo.to_str().unwrap(), None, reviewer).await?;
         ensure!(!thread.thread.id.is_empty(), "Missing Codex thread ID");
         client.clean_terminals(&thread.thread.id).await?;
         Ok::<_, anyhow::Error>(())

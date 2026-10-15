@@ -173,8 +173,9 @@ pub async fn execute(manager: &Manager, c: &CommandInteraction) -> Result<String
             .fetch_one(&manager.store.pool)
             .await?;
             Ok(format!(
-                "State: **{}**\nLatest turn: {}\nRepository reserved: {}\nPending requests: {} · Undelivered messages: {}\nUpdated: {}{}",
+                "State: **{}**\nPermissions: **{}**\nLatest turn: {}\nRepository reserved: {}\nPending requests: {} · Undelivered messages: {}\nUpdated: {}{}",
                 s.status,
+                manager.config.approvals_reviewer.label(),
                 s.last_outcome.as_deref().unwrap_or("none"),
                 s.repository_claimed,
                 pending,

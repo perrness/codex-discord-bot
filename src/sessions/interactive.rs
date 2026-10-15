@@ -77,7 +77,7 @@ impl Manager {
             });
             let (text, mut allowed) = render::approval_preview(method, &params, preview.as_ref());
             if method == PERMISSIONS_APPROVAL {
-                allowed = params.to_string().len() < 12000
+                allowed &= params.to_string().len() < 12000
                     && permissions_within_repo(
                         &params["permissions"],
                         Path::new(&session.working_directory),
@@ -175,7 +175,13 @@ impl Manager {
                 }
             }
             "decline" => match request.method.as_str() {
-                COMMAND_APPROVAL | FILE_APPROVAL => Some(json!({"decision":"decline"})),
+                COMMAND_APPROVAL | FILE_APPROVAL => {
+                    ensure!(
+                        render::approval_decision_available(params, "decline"),
+                        "Codex does not offer Decline for this request; use Cancel turn"
+                    );
+                    Some(json!({"decision":"decline"}))
+                }
                 PERMISSIONS_APPROVAL => Some(json!({"permissions":{},"scope":"turn"})),
                 _ => bail!("This request is not an approval"),
             },

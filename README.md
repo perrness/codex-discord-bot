@@ -16,7 +16,7 @@ The checkout in this development environment is `/root/repos/codex-discord-bot`.
 
 Inside the new task thread, send normal text to continue. During execution it steers the active turn; when idle it starts another turn in the same conversation. Use `/status` or `/stop` within that thread. `/stop` requests cancellation; the repository remains reserved until Codex reports a terminal outcome and background terminals have stopped.
 
-Ordinary agent questions accept normal messages. Structured questions have an **Answer questions** modal; a direct reply to a single-question prompt also works. Permission requests have separate approval/decline/cancel buttons. Command and file approvals apply to that request; **Allow this turn** grants a displayed permission profile for the current turn. Expired, already answered, cross-thread, or pre-restart buttons cannot authorize an operation.
+Ordinary agent questions accept normal messages. Structured questions have an **Answer questions** modal; a direct reply to a single-question prompt also works. The default permission mode is **Approve for me**: Codex automatically reviews eligible approval requests. `/status` shows the configured mode. Requests that still require your decision show the reason, working directory, command or file diff, and requested access, with supported approval/decline/cancel buttons. Command approvals apply to that request; file approvals also display any requested session write access. **Allow this turn** grants a displayed permission profile for the current turn. Expired, already answered, cross-thread, or pre-restart buttons cannot authorize an operation.
 
 One modifying turn at a time is allowed per repository, including while waiting for approval or recovering. Conversations in other repositories can run concurrently. Multiple idle conversations may refer to the same repository; the first one to acquire a claim can continue. There are no automatic worktrees.
 
@@ -53,6 +53,12 @@ Existing authentication can be reused by selecting its directory. Do not copy cr
 `TOOL_PATH` is an explicit list of absolute directories. Systemd does not source `.bashrc`, activate nvm, or expand `~` and `$HOME` in the environment file. Include the actual Rust/Node/Python tool locations your projects need. The App Server child receives `PATH`, `CODEX_HOME`, selected home/locale/CA variables, and no Discord token or database URL. Project-specific environment should use the service user's Codex configuration or project tooling; do not disable the sandbox to work around missing tools.
 
 Verify that the installed Codex Linux sandbox works as this account, including any required sandbox helpers and kernel/AppArmor support. The supplied unit uses `NoNewPrivileges=true`; a sandbox setup that depends on a setuid helper needs an administrator-supported configuration compatible with that restriction. The protocol smoke test verifies policy negotiation, not execution of a sandboxed model task.
+
+### Approval mode
+
+`CODEX_APPROVALS_REVIEWER=auto_review` selects **Approve for me** and is the default when the variable is absent, including on upgrades. Codex's [automatic reviewer](https://learn.chatgpt.com/docs/sandboxing/auto-review) evaluates eligible requests and can approve or deny them. The bot uses `on-request` approval policy with the workspace-write sandbox and restricted network access. Any request Codex sends to Discord still requires your click; the bot does not blindly accept requests.
+
+Set `CODEX_APPROVALS_REVIEWER=user` in the service environment file for **Ask for approval**. Only `auto_review` and `user` are supported; invalid values fail startup. The selected reviewer is applied to the App Server process, new conversations, resumed conversations, and every new turn, overriding the service user's Codex default. Rebuild and install the binary after upgrading, then restart the service to apply the mode. Restart expires pending approvals and interrupts active work; send a new message in the task thread to continue after recovery.
 
 ### Reuse PostgreSQL in Docker Compose
 
@@ -190,3 +196,5 @@ Tests cover path traversal/symlinks, exclusive project creation, authorization, 
 | `deploy/`, `scripts/` | Systemd unit and optional manual-session lock. |
 
 See [protocol details and supported limitations](docs/protocol.md) before changing the CLI version, approval policy, or restart behavior.
+
+Task threads mention the task requester for approvals, input requests, terminal turn outcomes (completed, failed, or interrupted), and recovery or expired-request notices. Routine progress stays quiet. Only the requester is allowed to be pinged; mentions embedded in model output cannot notify other users or roles. Migration `0002_attention_mentions.sql` adds the durable notification flag and applies automatically on startup.

@@ -49,9 +49,16 @@ impl Manager {
             return Ok(());
         };
         let channel = ChannelId::new(thread.parse()?);
+        let mut content = message.content.clone();
+        let mut mentions = CreateAllowedMentions::new();
+        if message.notify_requester {
+            let requester = UserId::new(session.requester_id.parse()?);
+            content = format!("<@{requester}>\n{content}");
+            mentions = mentions.users([requester]);
+        }
         let mut builder = CreateMessage::new()
-            .content(&message.content)
-            .allowed_mentions(CreateAllowedMentions::new())
+            .content(content)
+            .allowed_mentions(mentions)
             .nonce(Nonce::String(format!("outbox:{}", message.id)))
             .enforce_nonce(true);
         if let Some(id) = message.request_id {

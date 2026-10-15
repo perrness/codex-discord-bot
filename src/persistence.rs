@@ -46,6 +46,7 @@ pub struct PendingRequest {
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct OutboxMessage {
+    pub notify_requester: bool,
     pub id: i64,
     pub session_id: Uuid,
     pub content: String,
@@ -216,12 +217,52 @@ pub async fn enqueue(
     content: &str,
     request: Option<Uuid>,
 ) -> Result<()> {
-    let chunks = crate::discord::render::chunks(content);
+    let chunks = if request.is_some() {
+        crate::discord::render::interactive_chunks(content)
+    } else {
+        crate::discord::render::chunks(content)
+    };
     let last = chunks.len().saturating_sub(1);
+    let notify_requester = needs_attention(key, request.is_some());
     for (index, chunk) in chunks.into_iter().enumerate() {
-        sqlx::query("INSERT INTO discord_outbox(dedupe_key,session_id,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT(dedupe_key) DO NOTHING")
-            .bind(format!("{key}:{index}")).bind(session).bind(chunk).bind(if index == last { request } else { None })
+        sqlx::query("INSERT INTO discord_outbox(dedupe_key,session_id,content,request_id,notify_requester) VALUES($1,$2,$3,$4,$5) ON CONFLICT(dedupe_key) DO NOTHING")
+            .bind(format!("{key}:{index}")).bind(session).bind(chunk).bind(if index == last { request } else { None }).bind(notify_requester && index == last)
             .execute(&mut *conn).await?;
     }
     Ok(())
+}
+
+// Event keys describe durable bot events; never infer notifications from model prose.
+fn needs_attention(key: &str, interactive: bool) -> bool {
+    interactive
+        || key.ends_with(":terminal")
+        || ["recovery:", "recovered:", "expired:"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_attention;
+
+    #[test]
+    fn attention_events_notify_but_progress_and_retry_errors_do_not() {
+        assert!(needs_attention("request:question", true));
+        for key in [
+            "turn:terminal",
+            "recovery:generation:session",
+            "recovered:generation:session",
+            "expired:request",
+        ] {
+            assert!(needs_attention(key, false), "{key}");
+        }
+        for key in [
+            "turn:message",
+            "turn:plan",
+            "turn:error:true",
+            "turn:error:false",
+        ] {
+            assert!(!needs_attention(key, false), "{key}");
+        }
+    }
 }

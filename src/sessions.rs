@@ -210,7 +210,11 @@ impl Manager {
                 .await?;
             let codex = self
                 .client
-                .start_thread(&repo.path, self.config.model.as_deref())
+                .start_thread(
+                    &repo.path,
+                    self.config.model.as_deref(),
+                    self.config.approvals_reviewer,
+                )
                 .await?;
             sqlx::query("UPDATE sessions SET codex_thread_id=$2,updated_at=now() WHERE id=$1")
                 .bind(session.id)
@@ -251,7 +255,13 @@ impl Manager {
         tx.commit().await?;
         let turn = match self
             .client
-            .start_turn(thread, text, &session.working_directory, source)
+            .start_turn(
+                thread,
+                text,
+                &session.working_directory,
+                source,
+                self.config.approvals_reviewer,
+            )
             .await
         {
             Ok(r) => r.turn,
@@ -417,7 +427,11 @@ impl Manager {
                 }
                 if self
                     .client
-                    .resume_thread(thread, &session.working_directory)
+                    .resume_thread(
+                        thread,
+                        &session.working_directory,
+                        self.config.approvals_reviewer,
+                    )
                     .await
                     .is_err()
                 {

@@ -28,7 +28,7 @@ The client sends `initialize` with `clientInfo` and `capabilities.experimentalAp
 | --- | --- |
 | `thread/start` | Durable conversation with explicit `cwd`, `sandbox`, `approvalPolicy`, and `approvalsReviewer`. |
 | `thread/resume` | Reload a stored conversation with the same working directory and policy; `excludeTurns:true` limits response size. |
-| `turn/start` | Text input with explicit working directory and workspace-write sandbox policy. |
+| `turn/start` | Text input with explicit working directory, workspace-write sandbox policy, and configured approval reviewer. |
 | `turn/steer` | Follow-up during execution, guarded by `expectedTurnId`. |
 | `turn/interrupt` | Request interruption; retain the repository claim until terminal state and process cleanup. |
 | `thread/turns/list` | Inspect the latest turn and full items during startup reconciliation. |
@@ -47,15 +47,17 @@ The reader separates RPC responses from notifications and server requests. Bound
 
 | Server request | Response and Discord behavior |
 | --- | --- |
-| `item/commandExecution/requestApproval` | Original RPC ID with `{ "decision": "accept" }`, `decline`, or `cancel`. Preview command/network details; no session-wide acceptance or rule amendment. |
-| `item/fileChange/requestApproval` | Same decision shape; acceptance requires a complete file-change preview. |
-| `item/permissions/requestApproval` | `{ "permissions": <explicit grant>, "scope": "turn" }`; decline grants `{}`. Only understood fields and canonical paths within the task repository can be granted. Network requests are visible and require a click. |
+| `item/commandExecution/requestApproval` | Original RPC ID with `{ "decision": "accept" }`, `decline`, or `cancel`. Respect advertised acceptance/decline decisions. Show reason, exact command or terminal input, directory, and network/additional access; no session-wide acceptance or rule amendment. |
+| `item/fileChange/requestApproval` | Same decision shape; acceptance requires complete file paths, change kinds, and diffs. Display moves and any requested `grantRoot` session write access. |
+| `item/permissions/requestApproval` | `{ "permissions": <explicit grant>, "scope": "turn" }`; decline grants `{}`. Only understood fields and canonical paths within the task repository can be granted in Discord. Requests forwarded to Discord show network/file access and require a click. |
 | `item/tool/requestUserInput` | `{ "answers": { "questionId": { "answers": ["text"] } } }`; one modal field per question, at most five. A Discord reply to a single-question prompt is also accepted. |
 | `serverRequest/resolved` notification | Correlate the original request ID and process generation; remove controls and refresh waiting state. |
 
-Normal prose questions use normal Discord messages. Protocol questions require correlation to the pending request. Text cannot approve an operation. Requests flagged as secret input are rejected before persistence; configure credentials over SSH. Oversized or incomplete approval previews disable acceptance. Unanswered requests expire after an hour and interrupt the turn.
+Normal prose questions use normal Discord messages. Protocol questions require correlation to the pending request. Text cannot approve an operation. Requests flagged as secret input are rejected before persistence; configure credentials over SSH. Approval previews omit protocol IDs, timestamps, duplicate command parsing, and unused rule-amendment proposals. Unfamiliar request details remain visible. Commands and diffs use code fences maintained across Discord message boundaries; controls appear only after the full preview. Oversized or incomplete approval previews disable acceptance, including permission requests. Unanswered requests expire after an hour and interrupt the turn.
 
-Unknown interactions fail closed. MCP elicitation is declined; custom tool calls and external authentication refresh flows are unsupported. No approval is generated automatically. `on-request` with human reviewer is used: ordinary sandboxed operations may execute without an approval event, as designed by Codex. Workspace-write is not a read-isolation boundary for the whole Unix account. Review [Codex security](https://developers.openai.com/codex/security) before granting an unsandboxed command request.
+Unknown interactions fail closed. MCP elicitation forwarded to this client is declined; custom tool calls and external authentication refresh flows are unsupported. `CODEX_APPROVALS_REVIEWER` selects `auto_review` (default, **Approve for me**) or `user` (**Ask for approval**). The process config and `thread/start`, `thread/resume`, and `turn/start` explicitly send the selected reviewer with `on-request`. Thread responses must confirm that reviewer, the expected working directory, and the existing workspace-write/network restrictions. Invalid reviewer configuration or a mismatched effective policy fails closed.
+
+In `auto_review` mode, Codex's [automatic reviewer](https://learn.chatgpt.com/docs/sandboxing/auto-review) approves or denies eligible requests; the bot does not synthesize acceptance responses. Requests Codex still forwards to Discord retain the same human approval and correlation checks. Ordinary sandboxed operations may execute without an approval event in either mode. Automatic review does not disable the sandbox or guarantee approval. Workspace-write is not a read-isolation boundary for the whole Unix account. Review [Codex security](https://developers.openai.com/codex/security) before granting an unsandboxed command request.
 
 ## Restart semantics and limitations
 
@@ -63,6 +65,6 @@ The bot terminates its App Server process group on shutdown. The systemd unit ow
 
 Startup invalidates old approvals, marks incomplete input receipts uncertain, and reconciles claimed sessions before accepting Discord input. It resumes history, verifies idle state, cleans terminals, and compares the latest terminal turn ID with the persisted current turn. An unmatched or unknown outcome remains **unknown**. It may recover missing final messages, but never starts another turn to finish interrupted work. An unverifiable session keeps its repository claim for operator inspection.
 
-Managed subagents are disabled to keep one Discord thread mapped to one root conversation. V1 does not support linked Git worktrees, attachments, MCP login forms, session-wide approvals, or automatically continuing interrupted work. The working directory is stored separately from the repository, allowing a future worktree allocator without changing Discord routing.
+General multi-agent task tools are disabled to keep one Discord thread mapped to one root conversation; Codex's internal automatic approval reviewer is configured separately. V1 does not support linked Git worktrees, attachments, MCP login forms, session-wide command approval decisions, or automatically continuing interrupted work. The working directory is stored separately from the repository, allowing a future worktree allocator without changing Discord routing.
 
 Discord and PostgreSQL cannot share a transaction. Durable receipts prevent replaying accepted or uncertain task submissions; the outbox retries presentation separately. Discord nonce deduplication only covers a short recent window, so a crash after a successful send but before its database commit can duplicate a displayed message. It does not replay the coding task.

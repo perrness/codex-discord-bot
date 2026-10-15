@@ -47,7 +47,11 @@ impl Manager {
         self.take_repository_lock(&repo, session.id)?;
         let resumed = self
             .client
-            .resume_thread(thread, &session.working_directory)
+            .resume_thread(
+                thread,
+                &session.working_directory,
+                self.config.approvals_reviewer,
+            )
             .await?;
         ensure!(
             resumed.thread.status["type"] == "idle",
