@@ -32,7 +32,7 @@ impl Manager {
         let Some(thread) = &session.codex_thread_id else {
             // No turn can have been submitted without first persisting its Codex thread ID.
             let mut tx = self.store.pool.begin().await?;
-            sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,last_outcome='unknown',last_error='Setup was interrupted before task submission',updated_at=now() WHERE id=$1")
+            sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,channel_state=CASE WHEN discord_channel_id IS NULL AND channel_state='provisioning' AND EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1) THEN 'missing' ELSE channel_state END,last_outcome='unknown',last_error='Setup was interrupted before task submission',updated_at=now() WHERE id=$1")
                 .bind(session.id).execute(&mut *tx).await?;
             sqlx::query("UPDATE inbound_requests SET state='rejected',updated_at=now() WHERE session_id=$1 AND state IN ('received','uncertain')")
                 .bind(session.id).execute(&mut *tx).await?;
@@ -44,11 +44,7 @@ impl Manager {
                 .bind(session.repository_id)
                 .fetch_one(&self.store.pool)
                 .await?;
-        ensure!(
-            self.root.validate(&repo.name).await?.to_str()
-                == Some(session.working_directory.as_str()),
-            "Repository changed during downtime"
-        );
+        self.validate_session_directory(&repo, session).await?;
         self.take_repository_lock(&repo, session.id)?;
         let resumed = self
             .client

@@ -1925,6 +1925,21 @@ async fn issue_dispatch_links_existing_task_channels_and_never_replays_on_restar
     f.manager.register_repository("issues", true).await?;
     let store = &f.manager.store;
     let repo = store.repository("issues").await?;
+    let output = tokio::process::Command::new("git")
+        .current_dir(&repo.path)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial",
+        ])
+        .output()
+        .await?;
+    assert!(output.status.success());
     sqlx::query("INSERT INTO issue_queues(repository_id,requester_id,guild_id,paused) VALUES($1,'42','7',false)")
         .bind(repo.id).execute(&store.pool).await?;
     store.enqueue_issue(repo.id, "owner/repo", 3).await?;
@@ -1946,6 +1961,24 @@ async fn issue_dispatch_links_existing_task_channels_and_never_replays_on_restar
     .fetch_one(&store.pool)
     .await?;
     assert!(thread.is_some() && channel.is_some());
+    let (worktree, branch, session_id): (String, String, Uuid) =
+        sqlx::query_as("SELECT worktree,branch,session_id FROM issue_runs WHERE id=$1")
+            .bind(run.id)
+            .fetch_one(&store.pool)
+            .await?;
+    let session = store.session(session_id).await?;
+    assert_eq!(session.working_directory, worktree);
+    assert_ne!(worktree, repo.path);
+    assert!(branch.starts_with("codex/issue-3-attempt-1-"));
+    assert!(std::path::Path::new(&worktree).join(".git").is_file());
+    let observed = f.mock.observed.lock().unwrap().clone();
+    for method in ["thread/start", "turn/start"] {
+        assert!(
+            observed
+                .iter()
+                .any(|v| v["method"] == method && v["params"]["cwd"] == worktree)
+        );
+    }
     assert!(
         f.manager
             .create_task(42, 7, &source, "issues", "Duplicate")
@@ -1973,5 +2006,98 @@ async fn issue_dispatch_links_existing_task_channels_and_never_replays_on_restar
         .filter(|v| v["method"] == "turn/start")
         .count();
     assert_eq!(turns, 1);
+    // Explicitly close the recovered attempt, then dispatch a different issue.
+    f.manager.finish_task(42, 7, session_id, true).await?;
+    sqlx::query("UPDATE issue_runs SET state='cancelled' WHERE id=$1")
+        .bind(run.id)
+        .execute(&store.pool)
+        .await?;
+    store.enqueue_issue(repo.id, "owner/repo", 4).await?;
+    let second = store.claim_issue(repo.id).await?.unwrap();
+    f.manager
+        .create_task(
+            42,
+            7,
+            &format!("issue:{}", second.id),
+            "issues",
+            "Implement issue #4",
+        )
+        .await?;
+    let (next_thread, next_channel, next_worktree, next_branch): (String, String, String, String) = sqlx::query_as(
+        "SELECT codex_thread_id,discord_channel_id,worktree,branch FROM issue_execution WHERE id=$1")
+        .bind(second.id).fetch_one(&store.pool).await?;
+    assert_ne!(Some(next_thread.clone()), thread);
+    assert_ne!(Some(next_channel.clone()), channel);
+    assert_ne!(next_worktree, worktree);
+    assert_ne!(next_branch, branch);
+    assert_eq!(f.mock.count("thread/start"), 2);
+    assert_eq!(f.mock.count("turn/start"), 2);
+    let next_session = store.by_codex(&next_thread).await?.unwrap();
+    f.mock.send(json!({"id":"issue-approval","method":"item/commandExecution/requestApproval","params":{
+        "threadId":next_thread,"turnId":"turn-new","itemId":"exec-1","command":"cargo test","cwd":next_worktree}})).await;
+    f.status(next_session.id, "waiting").await?;
+    let request: PendingRequest =
+        sqlx::query_as("SELECT * FROM pending_requests WHERE session_id=$1")
+            .bind(next_session.id)
+            .fetch_one(&store.pool)
+            .await?;
+    assert!(
+        f.manager
+            .answer(
+                42,
+                7,
+                channel.unwrap().parse()?,
+                request.id,
+                "accept",
+                vec![]
+            )
+            .await
+            .is_err()
+    );
+    f.manager
+        .answer(42, 7, next_channel.parse()?, request.id, "accept", vec![])
+        .await?;
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn failed_issue_worktree_allocation_is_persisted_and_never_replayed() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager.prepare_discord().await?;
+    f.manager.register_repository("unborn", true).await?;
+    let store = &f.manager.store;
+    let repo = store.repository("unborn").await?;
+    sqlx::query("INSERT INTO issue_queues(repository_id,requester_id,guild_id,paused) VALUES($1,'42','7',false)")
+        .bind(repo.id).execute(&store.pool).await?;
+    store.enqueue_issue(repo.id, "owner/repo", 1).await?;
+    let run = store.claim_issue(repo.id).await?.unwrap();
+    let source = format!("issue:{}", run.id);
+    // No HEAD exists: Git fails after durable allocation intent has committed.
+    assert!(
+        f.manager
+            .create_task(42, 7, &source, "unborn", "Task")
+            .await
+            .is_err()
+    );
+    let (session, worktree, branch): (Uuid, String, String) =
+        sqlx::query_as("SELECT session_id,worktree,branch FROM issue_runs WHERE id=$1")
+            .bind(run.id)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(store.session(session).await?.working_directory, worktree);
+    assert!(!branch.is_empty());
+    f.manager.recover().await?;
+    store.reconcile_issues().await?;
+    assert!(store.claim_issue(repo.id).await?.is_none());
+    assert!(
+        f.manager
+            .create_task(42, 7, &source, "unborn", "Duplicate")
+            .await
+            .is_err()
+    );
+    assert_eq!(f.mock.count("thread/start"), 0);
+    assert_eq!(f.mock.count("turn/start"), 0);
     f.cleanup().await
 }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, postgres::PgPoolOptions};
@@ -228,8 +228,14 @@ impl Store {
         .bind(id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE issue_runs SET session_id=$2,updated_at=now() WHERE 'issue:' || id::text = $1 AND state='preparing'")
-            .bind(source).bind(id).execute(&mut *tx).await?;
+        if source.starts_with("issue:") {
+            let changed = sqlx::query("UPDATE issue_runs SET session_id=$2,updated_at=now() WHERE 'issue:' || id::text = $1 AND state='preparing' AND session_id IS NULL AND repository_id=$3")
+                .bind(source).bind(id).bind(repo.id).execute(&mut *tx).await?.rows_affected();
+            ensure!(
+                changed == 1,
+                "Issue attempt is already bound or no longer preparing"
+            );
+        }
         tx.commit().await?;
         self.session(id).await
     }

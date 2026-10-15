@@ -223,7 +223,9 @@ impl Manager {
         let _guard = gate.lock().await;
         let result = async {
             self.take_repository_lock(&repo, session.id)?;
+            self.prepare_issue_worktree(&repo, session.id).await?;
             let session = self.store.session(session.id).await?;
+            self.validate_session_directory(&repo, &session).await?;
             let channel = self.provision_channel(&session, name).await?;
             let current = self.store.session(session.id).await?;
             if let Err(error) = self.sync_status(&current).await {
@@ -237,7 +239,7 @@ impl Manager {
             let codex = self
                 .client
                 .start_thread(
-                    &repo.path,
+                    &session.working_directory,
                     self.config.model.as_deref(),
                     self.config.approvals_reviewer,
                 )
@@ -255,7 +257,7 @@ impl Manager {
         if result.is_err() {
             let current = self.store.session(session.id).await?;
             if current.status == "provisioning" {
-                sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,last_error='Setup failed; no task was submitted',updated_at=now() WHERE id=$1")
+                sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,channel_state=CASE WHEN discord_channel_id IS NULL AND channel_state='provisioning' THEN 'missing' ELSE channel_state END,last_error='Setup failed; no task was submitted',updated_at=now() WHERE id=$1")
                     .bind(session.id).execute(&self.store.pool).await?;
                 self.drop_repository_lock(&current);
                 self.store.receipt_state(source, "rejected").await?;
@@ -421,11 +423,7 @@ impl Manager {
                 .bind(session.repository_id)
                 .fetch_one(&self.store.pool)
                 .await?;
-                ensure!(
-                    self.root.validate(&repo.name).await?.to_str()
-                        == Some(session.working_directory.as_str()),
-                    "Repository directory changed"
-                );
+                self.validate_session_directory(&repo, session).await?;
                 let claim = sqlx::query("UPDATE sessions SET repository_claimed=true,status='provisioning',updated_at=now() WHERE id=$1 AND status='idle'")
                     .bind(session.id).execute(&self.store.pool).await;
                 match claim {

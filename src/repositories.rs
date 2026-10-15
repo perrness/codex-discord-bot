@@ -208,3 +208,136 @@ mod tests {
         assert!(RepositoryRoot::open(&link).is_err());
     }
 }
+
+/// Create once; leave failed or uncertain allocations intact for operator review.
+pub(crate) async fn create_issue_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+    let parent = path.parent().context("Worktree parent missing")?;
+    // Check each ancestor before creating children; never follow a pre-existing
+    // .worktrees or repository-name symlink while allocating directories.
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component);
+        match tokio::fs::create_dir(&current).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            current.canonicalize()? == current,
+            "Worktree parent contains symlinks"
+        );
+    }
+    ensure!(!path.try_exists()?, "Worktree path already exists");
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        git(repo)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(branch)
+            .arg(path)
+            .arg("HEAD")
+            .output(),
+    )
+    .await
+    .context("Worktree creation timed out; inspect allocation before retrying")??;
+    ensure!(
+        output.status.success(),
+        "Worktree creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    validate_issue_worktree(repo, path, branch).await
+}
+
+pub(crate) async fn validate_issue_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+    ensure!(
+        path.canonicalize()? == path,
+        "Worktree path contains symlinks"
+    );
+    for (args, expected) in [
+        (vec!["rev-parse", "--show-toplevel"], path.to_path_buf()),
+        (
+            vec!["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            repo.join(".git"),
+        ),
+    ] {
+        let output =
+            tokio::time::timeout(Duration::from_secs(10), git(path).args(args).output()).await??;
+        ensure!(
+            output.status.success()
+                && Path::new(String::from_utf8(output.stdout)?.trim_end()) == expected,
+            "Worktree repository identity changed"
+        );
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        git(path).args(["symbolic-ref", "--short", "HEAD"]).output(),
+    )
+    .await??;
+    ensure!(
+        output.status.success() && String::from_utf8(output.stdout)?.trim_end() == branch,
+        "Issue branch changed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn issue_worktrees_isolate_changes_and_reject_reuse_or_wrong_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RepositoryRoot::open(temp.path()).unwrap();
+        let repo = root.create("project").await.unwrap();
+        let output = git(&repo)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let a = temp.path().join(".worktrees/project/a");
+        let b = temp.path().join(".worktrees/project/b");
+        create_issue_worktree(&repo, &a, "codex/issue-1")
+            .await
+            .unwrap();
+        create_issue_worktree(&repo, &b, "codex/issue-2")
+            .await
+            .unwrap();
+        std::fs::write(a.join("private"), "issue one").unwrap();
+        assert!(!b.join("private").exists());
+        assert!(!repo.join("private").exists());
+        assert!(
+            create_issue_worktree(&repo, &a, "codex/issue-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_issue_worktree(&repo, &a, "codex/issue-2")
+                .await
+                .is_err()
+        );
+        let other = root.create("other").await.unwrap();
+        assert!(
+            validate_issue_worktree(&other, &a, "codex/issue-1")
+                .await
+                .is_err()
+        );
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert!(
+            validate_issue_worktree(&repo, &link, "codex/issue-1")
+                .await
+                .is_err()
+        );
+    }
+}

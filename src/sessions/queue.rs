@@ -2,6 +2,87 @@ use super::*;
 use crate::queue::{Run, State};
 
 impl Manager {
+    pub(super) async fn prepare_issue_worktree(
+        &self,
+        repo: &Repository,
+        session: Uuid,
+    ) -> Result<()> {
+        let run: Option<Run> =
+            sqlx::query_as("SELECT * FROM issue_runs WHERE session_id=$1 AND state='preparing'")
+                .bind(session)
+                .fetch_optional(&self.store.pool)
+                .await?;
+        let Some(run) = run else {
+            return Ok(());
+        };
+        let branch = format!(
+            "codex/issue-{}-attempt-{}-{}",
+            run.issue_number, run.attempt, run.id
+        );
+        let path = std::path::Path::new(&repo.path)
+            .parent()
+            .context("Repository has no parent")?
+            .join(".worktrees")
+            .join(&repo.name)
+            .join(run.id.to_string());
+        let path = path.to_str().context("Worktree path is not UTF-8")?;
+        // Persist intent before Git: a partial or uncertain creation is never retried.
+        let mut tx = self.store.pool.begin().await?;
+        let changed = sqlx::query("UPDATE issue_runs SET branch=$2,worktree=$3,updated_at=now() WHERE id=$1 AND session_id=$4 AND state='preparing' AND branch IS NULL AND worktree IS NULL")
+            .bind(run.id).bind(&branch).bind(path).bind(session).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            changed == 1,
+            "Worktree setup already attempted; inspect it before retrying"
+        );
+        sqlx::query("UPDATE sessions SET working_directory=$2 WHERE id=$1")
+            .bind(session)
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        crate::repositories::create_issue_worktree(
+            std::path::Path::new(&repo.path),
+            std::path::Path::new(path),
+            &branch,
+        )
+        .await
+    }
+
+    pub(super) async fn validate_session_directory(
+        &self,
+        repo: &Repository,
+        session: &Session,
+    ) -> Result<()> {
+        let main = self.root.validate(&repo.name).await?;
+        ensure!(main.to_str() == Some(&repo.path), "Repository path changed");
+        let mapping: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT worktree,branch FROM issue_runs WHERE session_id=$1 AND repository_id=$2",
+        )
+        .bind(session.id)
+        .bind(repo.id)
+        .fetch_optional(&self.store.pool)
+        .await?;
+        if let Some((path, branch)) = mapping {
+            let path = path.context("Issue worktree was not prepared")?;
+            ensure!(
+                path == session.working_directory,
+                "Issue working directory changed"
+            );
+            crate::repositories::validate_issue_worktree(
+                &main,
+                std::path::Path::new(&path),
+                &branch.context("Issue branch missing")?,
+            )
+            .await?;
+        } else {
+            ensure!(
+                main.to_str() == Some(&session.working_directory),
+                "Repository directory changed"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn queue_command(
         &self,
         action: &str,
