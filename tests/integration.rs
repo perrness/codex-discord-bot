@@ -1110,6 +1110,7 @@ async fn migration_preserves_legacy_execution_and_approval_records() -> Result<(
         include_str!("../migrations/0009_issue_concurrency.sql"),
         include_str!("../migrations/0010_issue_releases.sql"),
         include_str!("../migrations/0011_repository_workflow.sql"),
+        include_str!("../migrations/0012_completion_cleanup.sql"),
     ] {
         sqlx::raw_sql(migration).execute(&mut *tx).await?;
     }

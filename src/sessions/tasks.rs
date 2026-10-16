@@ -136,8 +136,21 @@ impl Manager {
                         matches!(run.state.as_str(), "awaiting_input" | "completed"),
                         "The repository workflow has not finished a successful turn; inspect /queue status"
                     );
-                    sqlx::query("INSERT INTO issue_workflow_completions(run_id,confirmed_by) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                        .bind(run.id).bind(user.to_string()).execute(&mut *tx).await?;
+                    let recorded: Option<String> = sqlx::query_scalar(
+                        "SELECT revision FROM issue_workflow_completions WHERE run_id=$1",
+                    )
+                    .bind(run.id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten();
+                    let revision = match recorded {
+                        Some(revision) => revision,
+                        None => self.workflow_cleanup_revision(&run, &session).await?,
+                    };
+                    sqlx::query("INSERT INTO issue_workflow_completions(run_id,confirmed_by,revision) VALUES($1,$2,$3) ON CONFLICT (run_id) DO UPDATE SET revision=COALESCE(issue_workflow_completions.revision,EXCLUDED.revision)")
+                        .bind(run.id).bind(user.to_string()).bind(&revision).execute(&mut *tx).await?;
+                    sqlx::query("INSERT INTO issue_worktree_cleanup(run_id,kind,path,branch,revision) SELECT id,'issue',worktree,branch,$2 FROM issue_runs WHERE id=$1 ON CONFLICT (run_id,kind) DO NOTHING")
+                        .bind(run.id).bind(revision).execute(&mut *tx).await?;
                 }
                 sqlx::query("DELETE FROM issue_release_locks WHERE run_id=$1")
                     .bind(run.id)
@@ -167,16 +180,26 @@ impl Manager {
         }
         sqlx::query("UPDATE sessions SET channel_state=$2,completed_at=now(),delete_after=now()+make_interval(secs => $3::double precision),updated_at=now() WHERE id=$1")
             .bind(id).bind(state).bind(self.config.channel_retention.as_secs_f64()).execute(&mut *tx).await?;
-        let next = if repository_workflow {
+        let next = if repository_workflow && dismiss {
             "The issue worktree and branch are preserved."
+        } else if repository_workflow {
+            "Cleanup of the issue worktree and local branch is scheduled. Changed or unverifiable work is preserved; check /queue status for cleanup errors."
         } else if is_issue {
-            "Issue worktrees are preserved on failure; clean worktrees are eligible for cleanup after release confirmation."
+            "Issue worktrees and branches are preserved on failure; cleanup is scheduled after verified release."
         } else {
             "Reply before then to reopen it."
         };
         persistence::enqueue(&mut tx, id, &format!("task-{state}:{id}:{}", session.status_revision),
             &format!("Task **{state}**. This channel will move to COMPLETED and be deleted after {} hours. {next}", self.config.channel_retention.as_secs() / 3600), None).await?;
         tx.commit().await?;
+        drop(_guard);
+        if is_issue && !dismiss {
+            // Completion is already durable. A transient cleanup failure must
+            // not report the confirmed task as unfinished; maintenance retries.
+            if let Err(error) = self.cleanup_worktrees(Some(id)).await {
+                tracing::warn!(session = %id, %error, "Completion cleanup deferred to maintenance");
+            }
+        }
         Ok(format!(
             "Task {state}. Channel move and cleanup are scheduled."
         ))

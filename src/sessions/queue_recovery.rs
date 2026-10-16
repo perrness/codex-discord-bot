@@ -137,11 +137,41 @@ impl Manager {
         Ok(())
     }
 
-    /// Safe to retry: each attempt re-observes identity and cleanliness. A failed
-    /// run never gets a cleanup record, and no branch is deleted or force removed.
+    /// Capture the completion revision under the session gate and a shared
+    /// repository lock. Dirty files block removal, not task completion.
+    pub(super) async fn workflow_cleanup_revision(
+        &self,
+        run: &Run,
+        session: &Session,
+    ) -> Result<String> {
+        let repo: Repository =
+            sqlx::query_as("SELECT id,name,path,github_repository FROM repositories WHERE id=$1")
+                .bind(run.repository_id)
+                .fetch_one(&self.store.pool)
+                .await?;
+        self.take_repository_lock(&repo, session.id, true)?;
+        let result = async {
+            self.inspect_issue_worktrees(run).await?;
+            crate::integration::git::revision(
+                Path::new(&session.working_directory),
+                "HEAD^{commit}",
+            )
+            .await
+        }
+        .await;
+        self.drop_repository_lock(session);
+        result.context("Could not record the completed worktree revision")
+    }
+
+    /// Safe to retry: each attempt re-observes identity and cleanliness before
+    /// removing a worktree and its unchanged local branch. Never force removal.
     pub async fn cleanup_completed_worktrees(&self) -> Result<()> {
-        let pending: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT DISTINCT r.id,r.session_id FROM issue_runs r JOIN issue_worktree_cleanup c ON c.run_id=r.id JOIN sessions s ON s.id=r.session_id WHERE r.state='released' AND r.id IN (SELECT id FROM confirmed_issue_releases) AND c.state <> 'removed' AND s.channel_state IN ('completed','deleted') AND NOT s.repository_claimed AND s.current_turn_id IS NULL")
-            .fetch_all(&self.store.pool).await?;
+        self.cleanup_worktrees(None).await
+    }
+
+    pub(super) async fn cleanup_worktrees(&self, only_session: Option<Uuid>) -> Result<()> {
+        let pending: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT DISTINCT r.id,r.session_id FROM issue_runs r JOIN issue_worktree_cleanup c ON c.run_id=r.id JOIN sessions s ON s.id=r.session_id WHERE ((r.workflow='managed' AND r.state='released' AND r.id IN (SELECT id FROM confirmed_issue_releases)) OR (r.workflow='repository' AND r.state='completed' AND EXISTS(SELECT 1 FROM issue_workflow_completions w WHERE w.run_id=r.id AND w.revision=c.revision))) AND c.state <> 'removed' AND s.channel_state IN ('completed','deleted') AND NOT s.repository_claimed AND s.current_turn_id IS NULL AND ($1::uuid IS NULL OR s.id=$1)")
+            .bind(only_session).fetch_all(&self.store.pool).await?;
         for (run, session) in pending {
             let gate = self.gate(session);
             let Ok(_guard) = gate.try_lock() else {
@@ -151,8 +181,10 @@ impl Manager {
             let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE repository_id=$1 AND repository_claimed)")
                 .bind(session.repository_id).fetch_one(&self.store.pool).await?;
             if busy
+                || session.repository_claimed
                 || session.current_turn_id.is_some()
                 || !matches!(session.channel_state.as_str(), "completed" | "deleted")
+                || self.store.unresolved(session.id).await?
             {
                 continue;
             }
@@ -184,7 +216,7 @@ impl Manager {
             let result = self.remove_issue_worktree(repo, &cleanup).await;
             let error = result
                 .err()
-                .map(|e| format!("{} worktree cleanup blocked: {e:#}", cleanup.kind));
+                .map(|e| format!("{} worktree/branch cleanup blocked: {e:#}", cleanup.kind));
             let mut tx = self.store.pool.begin().await?;
             sqlx::query("UPDATE issue_worktree_cleanup SET state=$3,last_error=$4,updated_at=now() WHERE run_id=$1 AND kind=$2")
                 .bind(run).bind(&cleanup.kind).bind(if error.is_some() { "blocked" } else { "removed" }).bind(&error).execute(&mut *tx).await?;
@@ -213,29 +245,37 @@ impl Manager {
     async fn remove_issue_worktree(&self, repo: &Repository, c: &Cleanup) -> Result<()> {
         let main = self.root.validate(&repo.name).await?;
         ensure!(main.to_str() == Some(&repo.path), "Repository path changed");
-        let i = self
-            .store
-            .integration(c.run_id)
-            .await?
-            .context("Missing integration evidence")?;
+        let run: Run = sqlx::query_as("SELECT * FROM issue_runs WHERE id=$1")
+            .bind(c.run_id)
+            .fetch_one(&self.store.pool)
+            .await?;
+        let i = self.store.integration(c.run_id).await?;
         let (path, branch, revision) = if c.kind == "integration" {
+            ensure!(run.workflow == "managed", "Unexpected integration cleanup");
+            let i = i.context("Missing integration evidence")?;
             (
                 format!("integration-{}", c.run_id),
                 format!("codex/integration-{}", c.run_id),
                 i.candidate_sha,
             )
         } else {
-            let run: Run = sqlx::query_as("SELECT * FROM issue_runs WHERE id=$1")
-                .bind(c.run_id)
+            let revision = if run.workflow == "repository" {
+                sqlx::query_scalar(
+                    "SELECT revision FROM issue_workflow_completions WHERE run_id=$1",
+                )
+                .bind(run.id)
                 .fetch_one(&self.store.pool)
-                .await?;
+                .await?
+            } else {
+                i.context("Missing integration evidence")?.source_sha
+            };
             (
                 run.id.to_string(),
                 format!(
                     "codex/issue-{}-attempt-{}-{}",
                     run.issue_number, run.attempt, run.id
                 ),
-                i.source_sha,
+                revision,
             )
         };
         let expected = self
@@ -248,7 +288,7 @@ impl Manager {
             Path::new(&c.path) == expected
                 && c.branch == branch
                 && Some(&c.revision) == revision.as_ref(),
-            "Cleanup identity differs from the released attempt"
+            "Cleanup identity differs from the completed attempt"
         );
         crate::repositories::remove_completed_worktree(&main, &expected, &c.branch, &c.revision)
             .await

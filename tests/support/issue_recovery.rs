@@ -2,7 +2,7 @@ use super::*;
 use codex_discord_bot::queue::{Run, State};
 use std::path::{Path, PathBuf};
 
-async fn git(path: &Path, args: &[&str]) -> Result<String> {
+pub(super) async fn git(path: &Path, args: &[&str]) -> Result<String> {
     let output = tokio::process::Command::new("git")
         .current_dir(path)
         .args([
@@ -394,9 +394,18 @@ async fn release_confirmation_and_cleanup_survive_crashes_without_releasing_twic
     assert_eq!(f.mock.count("turn/start"), 1);
     let branch = format!("refs/heads/codex/issue-5-attempt-1-{}", run.id);
     assert!(
-        !git(Path::new(&repo.path), &["rev-parse", "--verify", &branch])
-            .await?
-            .is_empty()
+        git(Path::new(&repo.path), &["rev-parse", "--verify", &branch])
+            .await
+            .is_err()
+    );
+    let integration_branch = format!("refs/heads/codex/integration-{}", run.id);
+    assert!(
+        git(
+            Path::new(&repo.path),
+            &["rev-parse", "--verify", &integration_branch]
+        )
+        .await
+        .is_err()
     );
     store.enqueue_issue(repo.id, "owner/repo", 9).await?;
     assert_eq!(store.claim_issue(repo.id).await?.unwrap().issue_number, 9);

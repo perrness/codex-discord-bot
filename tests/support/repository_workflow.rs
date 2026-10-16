@@ -1,5 +1,7 @@
+use super::issue_recovery::git;
 use super::*;
 use codex_discord_bot::queue::{Run, State};
+use std::path::Path;
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
@@ -335,6 +337,17 @@ async fn repository_workflow_continues_without_policies_and_user_confirms_comple
         "User confirmation must not fabricate managed release evidence"
     );
     assert!(std::path::Path::new(&session.working_directory).exists());
+    let cleanup: (String, String) =
+        sqlx::query_as("SELECT state,last_error FROM issue_worktree_cleanup WHERE run_id=$1")
+            .bind(issue.id)
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!(cleanup.0, "blocked");
+    assert!(cleanup.1.contains("worktree changed"));
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&session.working_directory).join("implementation"))?,
+        "preserved"
+    );
     f.manager
         .store
         .require_released_dependencies(&[("owner/repo".into(), 5)])
@@ -354,6 +367,144 @@ async fn repository_workflow_continues_without_policies_and_user_confirms_comple
     f.manager.finish_task(42, 7, session.id, true).await?;
     assert_eq!(run(&f, issue.id).await?.state, "completed");
     assert!(f.manager.store.retry_issue(repo.id, 5).await.is_err());
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn completion_cleans_the_confirmed_worktree_and_branch_and_can_be_reconfirmed() -> Result<()>
+{
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (issue, session) = f.issue_task("completion-cleanup").await?;
+    let repo = f.manager.store.repository("completion-cleanup").await?;
+    let main = Path::new(&repo.path);
+    let original = git(main, &["rev-parse", "HEAD"]).await?;
+    let path = Path::new(&session.working_directory);
+    std::fs::write(path.join("implementation"), "finished")?;
+    git(path, &["add", "implementation"]).await?;
+    git(path, &["commit", "-m", "Complete issue"]).await?;
+    let revision = git(path, &["rev-parse", "HEAD"]).await?;
+    let branch = git(path, &["symbolic-ref", "HEAD"]).await?;
+    finish_turn(&f, &session).await?;
+    assert!(
+        f.manager
+            .finish_task(99, 7, session.id, false)
+            .await
+            .is_err()
+    );
+    assert!(path.exists());
+    f.manager.finish_task(42, 7, session.id, false).await?;
+    assert!(!path.exists());
+    assert!(
+        git(main, &["rev-parse", "--verify", &branch])
+            .await
+            .is_err()
+    );
+    assert_eq!(git(main, &["rev-parse", "HEAD"]).await?, original);
+    let receipt: (String, String) = sqlx::query_as(
+        "SELECT confirmed_by,revision FROM issue_workflow_completions WHERE run_id=$1",
+    )
+    .bind(issue.id)
+    .fetch_one(&f.manager.store.pool)
+    .await?;
+    assert_eq!(receipt, ("42".into(), revision.clone()));
+    // Reconnecting presentation and confirming again must use the original
+    // revision, even though both the worktree and branch have already gone.
+    sqlx::query("UPDATE sessions SET channel_state='active' WHERE id=$1")
+        .bind(session.id)
+        .execute(&f.manager.store.pool)
+        .await?;
+    f.manager.finish_task(42, 7, session.id, false).await?;
+    f.manager.recover_issue_queue().await?;
+    let cleanups: Vec<(String, String)> =
+        sqlx::query_as("SELECT state,revision FROM issue_worktree_cleanup WHERE run_id=$1")
+            .bind(issue.id)
+            .fetch_all(&f.manager.store.pool)
+            .await?;
+    assert_eq!(cleanups, vec![("removed".into(), revision)]);
+    assert_eq!(f.mock.count("turn/start"), 1);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn completion_cleanup_waits_for_repository_lock_and_recovers_partial_cleanup() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (issue, session) = f.issue_task("cleanup-lock").await?;
+    let path = Path::new(&session.working_directory);
+    let branch = git(path, &["symbolic-ref", "HEAD"]).await?;
+    finish_turn(&f, &session).await?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.manager.config.state_dir.join("locks/cleanup-lock.lock"))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockShared)?;
+    f.manager.finish_task(42, 7, session.id, false).await?;
+    assert!(
+        path.exists(),
+        "Cleanup requires exclusive repository ownership"
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM issue_worktree_cleanup WHERE run_id=$1")
+            .bind(issue.id)
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!(state, "pending");
+    drop(lock);
+    // Crash after Git removed the worktree but before branch removal and the
+    // database acknowledgement. Recovery observes and finishes the same intent.
+    let repo = f.manager.store.repository("cleanup-lock").await?;
+    let main = Path::new(&repo.path);
+    sqlx::query("UPDATE issue_worktree_cleanup SET state='removing' WHERE run_id=$1")
+        .bind(issue.id)
+        .execute(&f.manager.store.pool)
+        .await?;
+    git(
+        main,
+        &["worktree", "remove", "--", &session.working_directory],
+    )
+    .await?;
+    assert!(git(main, &["rev-parse", "--verify", &branch]).await.is_ok());
+    for _ in 0..2 {
+        f.manager.recover_issue_queue().await?;
+    }
+    assert!(
+        git(main, &["rev-parse", "--verify", &branch])
+            .await
+            .is_err()
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM issue_worktree_cleanup WHERE run_id=$1")
+            .bind(issue.id)
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!(state, "removed");
+    assert_eq!(f.mock.count("turn/start"), 1);
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn dismissal_preserves_even_clean_repository_worktrees_and_branches() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (issue, session) = f.issue_task("dismiss-cleanup").await?;
+    let path = Path::new(&session.working_directory);
+    let branch = git(path, &["symbolic-ref", "HEAD"]).await?;
+    finish_turn(&f, &session).await?;
+    f.manager.finish_task(42, 7, session.id, true).await?;
+    f.manager.cleanup_completed_worktrees().await?;
+    assert!(path.exists());
+    assert!(git(path, &["rev-parse", "--verify", &branch]).await.is_ok());
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issue_worktree_cleanup WHERE run_id=$1")
+            .bind(issue.id)
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!(count, 0);
+    assert_eq!(run(&f, issue.id).await?.state, "cancelled");
     f.cleanup().await
 }
 
