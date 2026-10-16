@@ -102,7 +102,7 @@ impl Store {
             _ => Decision::Blocked,
         };
         let reason = match decision {
-            Decision::Passed => "Trusted build, test and lint checks passed. Preparing a fresh integration candidate.".to_owned(),
+            Decision::Passed => "Trusted build, test and lint checks passed. Waiting for the repository integration/release slot before preparing a fresh candidate.".to_owned(),
             Decision::Repair => format!("Trusted validation failed. Starting repair {} of {} in this issue's conversation.", repairs + 1, policy.as_ref().context("Missing repair policy")?.max_repairs),
             Decision::Blocked => error.map(str::to_owned).unwrap_or_else(||
                 "Validation blocked: checks failed, were incomplete/cancelled, or the repair limit was exhausted. Inspect the recorded results; dismiss and explicitly retry the issue after review.".into()),
@@ -142,7 +142,7 @@ impl Store {
             } else {
                 State::Blocked
             };
-            let changed = sqlx::query("UPDATE issue_runs SET state=$3,last_error=$4,updated_at=now() WHERE id=$1 AND claim_id=$2 AND ($3 <> 'integrating' OR id IN (SELECT id FROM validated_issue_runs))")
+            let changed = sqlx::query("UPDATE issue_runs SET state=$3,last_error=$4,integration_ready_at=CASE WHEN $3='integrating' THEN now() ELSE integration_ready_at END,updated_at=now() WHERE id=$1 AND claim_id=$2 AND ($3 <> 'integrating' OR id IN (SELECT id FROM validated_issue_runs))")
                 .bind(run.id).bind(run.claim_id).bind(next.as_str())
                 .bind(if decision == Decision::Passed { None } else { Some(reason.as_str()) }).execute(&mut *tx).await?.rows_affected();
             ensure!(changed == 1, "Missing successful validation evidence");

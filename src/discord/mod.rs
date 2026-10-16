@@ -218,14 +218,21 @@ impl Handler {
             self.manager.log_discord_failure(None, &error);
             error.to_string()
         });
-        command
-            .edit_response(
-                &ctx.http,
-                EditInteractionResponse::new()
-                    .content(render::short(&text, 1800))
-                    .allowed_mentions(CreateAllowedMentions::new()),
-            )
-            .await?;
+        let mut response = EditInteractionResponse::new()
+            .content(render::short(&text, 1800))
+            .allowed_mentions(CreateAllowedMentions::new());
+        if command.data.name == "queue" && text.encode_utf16().count() > 1800 {
+            response = response
+                .content(format!(
+                    "{}\nFull queue details are attached.",
+                    render::short(&text, 1700)
+                ))
+                .new_attachment(CreateAttachment::bytes(
+                    text.as_bytes().to_vec(),
+                    "queue-status.txt",
+                ));
+        }
+        command.edit_response(&ctx.http, response).await?;
         Ok(())
     }
 

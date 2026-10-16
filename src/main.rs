@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
         .fetch_one(&mut *leader)
         .await?;
     ensure!(elected, "Another bot instance owns this database");
+    store.configure_issue_workers(config.issue_workers).await?;
     let (mut server, events) = Server::spawn(&config).await?;
     let http = Arc::new(Http::new(&config.discord_token));
     let manager = Arc::new(Manager::new(

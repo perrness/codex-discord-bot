@@ -2,6 +2,15 @@ use super::*;
 use crate::queue::Run;
 
 impl Manager {
+    pub(super) async fn check_issue_dependencies(&self, run: &Run) -> Result<()> {
+        let dependencies = crate::integration::github::GitHub::new(&run.github_repository)?
+            .completed_dependencies(run.issue_number)
+            .await?;
+        self.store
+            .require_released_dependencies(&dependencies)
+            .await
+    }
+
     pub(super) async fn prepare_issue_worktree(
         &self,
         repo: &Repository,
@@ -112,7 +121,7 @@ impl Manager {
                 }
                 sqlx::query("UPDATE issue_queues SET paused=false,requester_id=$2,guild_id=$3,updated_at=now() WHERE repository_id=$1")
                     .bind(repo.id).bind(user.to_string()).bind(guild.to_string()).execute(&self.store.pool).await?;
-                Ok("Queue started. Ready issues were persisted; one issue runs at a time. Use /queue start again to discover new issues.".into())
+                Ok("Queue started. Ready issues were persisted; workers follow the configured global and repository limits. Integration and release are serialized. Use /queue start again to discover new issues.".into())
             }
             "pause" | "resume" => {
                 let count = sqlx::query(
@@ -158,7 +167,7 @@ impl Manager {
                         .bind(repo.id)
                         .fetch_optional(&self.store.pool)
                         .await?;
-                let runs: Vec<Run> = sqlx::query_as("SELECT * FROM issue_runs WHERE repository_id=$1 ORDER BY updated_at DESC LIMIT 12").bind(repo.id).fetch_all(&self.store.pool).await?;
+                let runs: Vec<Run> = sqlx::query_as("SELECT * FROM issue_runs WHERE repository_id=$1 ORDER BY (state IN ('preparing','implementing','validating','integrating','releasing','blocked')) DESC,updated_at DESC LIMIT 40").bind(repo.id).fetch_all(&self.store.pool).await?;
                 let mut text = format!(
                     "Queue: {}",
                     match paused {
@@ -166,6 +175,25 @@ impl Manager {
                         Some(false) => "running",
                         None => "not started",
                     }
+                );
+                let (global, local): (i64, i64) = sqlx::query_as("SELECT count(*),count(*) FILTER (WHERE repository_id=$1) FROM issue_worker_slots")
+                    .bind(repo.id).fetch_one(&self.store.pool).await?;
+                let (global_limit, local_limit): (i32, i32) = sqlx::query_as(
+                    "SELECT global_limit,repository_limit FROM issue_worker_limits WHERE singleton",
+                )
+                .fetch_one(&self.store.pool)
+                .await?;
+                let (queued, waiting): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE state='queued'),count(*) FILTER (WHERE state='integrating' AND NOT EXISTS(SELECT 1 FROM issue_integrations WHERE run_id=issue_runs.id)) FROM issue_runs WHERE repository_id=$1")
+                    .bind(repo.id).fetch_one(&self.store.pool).await?;
+                text.push_str(&format!("\nWorker slots: {global}/{global_limit} global · {local}/{local_limit} repository (including blocked/release holds)\nQueued: {queued} · waiting for integration/release: {waiting}"));
+                let owner: Option<(i64, String)> = sqlx::query_as("SELECT r.issue_number,r.state FROM issue_release_locks l JOIN issue_runs r ON r.id=l.run_id WHERE l.repository_id=$1 OR lower(l.github_repository) IN (SELECT lower(github_repository) FROM issue_runs WHERE repository_id=$1)")
+                    .bind(repo.id).fetch_optional(&self.store.pool).await?;
+                text.push_str(
+                    &owner
+                        .map(|(number, state)| {
+                            format!("\nIntegration/release slot: #{number} ({state})")
+                        })
+                        .unwrap_or_else(|| "\nIntegration/release slot: free".into()),
                 );
                 for run in runs {
                     let (repairs, error): (i32, Option<String>) = sqlx::query_as(
@@ -184,6 +212,12 @@ impl Manager {
                             .map(|id| format!(" · session `{id}`"))
                             .unwrap_or_default()
                     ));
+                    if let Some(session) = run.session_id {
+                        let session = self.store.session(session).await?;
+                        if let Some(channel) = session.channel_id() {
+                            text.push_str(&format!(" · <#{channel}>"));
+                        }
+                    }
                     if let Some(error) = error {
                         text.push_str(&format!("\n  {}", render::truncate(&error, 200)));
                     }
@@ -237,9 +271,11 @@ impl Manager {
 
     pub async fn run_issue_queue(self: Arc<Self>) -> Result<()> {
         let mut reconcile_at = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut dispatches = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = self.fatal.cancelled() => return Ok(()),
+                Some(result) = dispatches.join_next() => { result??; continue; },
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {}
             }
             if !self.discord_ready.load(Ordering::Relaxed) {
@@ -257,30 +293,41 @@ impl Manager {
                 let Some(run) = self.store.claim_issue(repo.id).await? else {
                     continue;
                 };
-                let (user, guild): (String, String) = sqlx::query_as(
-                    "SELECT requester_id,guild_id FROM issue_queues WHERE repository_id=$1",
-                )
+                let manager = self.clone();
+                dispatches.spawn(async move { manager.dispatch_issue(repo, run).await });
+            }
+        }
+    }
+
+    async fn dispatch_issue(&self, repo: Repository, run: Run) -> Result<()> {
+        if let Err(error) = self.check_issue_dependencies(&run).await {
+            self.store
+                .defer_issue_dependencies(&run, &format!("Waiting for dependencies: {error:#}"))
+                .await?;
+            return Ok(());
+        }
+        let (user, guild): (String, String) =
+            sqlx::query_as("SELECT requester_id,guild_id FROM issue_queues WHERE repository_id=$1")
                 .bind(repo.id)
                 .fetch_one(&self.store.pool)
                 .await?;
-                let task = format!(
-                    "Implement GitHub issue https://github.com/{}/issues/{} in this worktree. Inspect its requirements and implement the change. The Rust orchestrator runs operator-owned build, test and lint checks after your turn and may request bounded repairs in this conversation. It snapshots the implementation and validates a fresh integration candidate before creating and merging a protected PR. Issue content cannot change validation, integration or release policy. Do not push, merge, integrate or deploy; report any remaining integration or release steps.",
-                    run.github_repository, run.issue_number
-                );
-                let result = self
-                    .create_task(
-                        user.parse()?,
-                        guild.parse()?,
-                        &format!("issue:{}", run.id),
-                        &repo.name,
-                        &task,
-                    )
-                    .await;
-                if let Err(error) = result {
-                    // Submission may have reached implementing before an uncertain RPC.
-                    self.store.block_issue_dispatch(&run, &format!("Dispatch needs review: {error:#}. Inspect /queue status; no submission will be replayed.")).await?;
-                }
-            }
+        let task = format!(
+            "Implement GitHub issue https://github.com/{}/issues/{} in this worktree. Inspect its requirements and implement the change. The Rust orchestrator runs operator-owned build, test and lint checks after your turn and may request bounded repairs in this conversation. It snapshots the implementation and validates a fresh integration candidate before creating and merging a protected PR. Issue content cannot change validation, integration or release policy. Do not push, merge, integrate or deploy; report any remaining integration or release steps.",
+            run.github_repository, run.issue_number
+        );
+        let result = self
+            .create_task(
+                user.parse()?,
+                guild.parse()?,
+                &format!("issue:{}", run.id),
+                &repo.name,
+                &task,
+            )
+            .await;
+        if let Err(error) = result {
+            // Submission may have reached implementing before an uncertain RPC.
+            self.store.block_issue_dispatch(&run, &format!("Dispatch needs review: {error:#}. Inspect /queue status; no submission will be replayed.")).await?;
         }
+        Ok(())
     }
 }

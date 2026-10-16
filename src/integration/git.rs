@@ -40,19 +40,25 @@ pub(crate) async fn fetch(path: &Path, remote: &str, reference: &str) -> Result<
         reference.starts_with("refs/"),
         "Expected a full Git reference"
     );
+    // FETCH_HEAD is shared by every linked worktree. Pin this fetch to a unique
+    // ref so another issue's fetch cannot silently change the candidate base.
+    let fetched = format!("refs/codex/fetch/{}", uuid::Uuid::new_v4());
     network(
         path,
         &[
             "fetch",
             "--no-tags",
             "--no-recurse-submodules",
+            "--no-write-fetch-head",
             "--",
             remote,
-            reference,
+            &format!("{reference}:{fetched}"),
         ],
     )
     .await?;
-    revision(path, "FETCH_HEAD^{commit}").await
+    let sha = revision(path, &format!("{fetched}^{{commit}}")).await?;
+    run(path, &["update-ref", "-d", &fetched, &sha]).await?;
+    Ok(sha)
 }
 
 pub(crate) async fn snapshot(path: &Path, issue: i64) -> Result<String> {
@@ -207,6 +213,40 @@ mod tests {
         std::fs::write(repo.join("file"), "initial\n").unwrap();
         let base = snapshot(&repo, 1).await.unwrap();
         (temp, repo, base)
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetches_pin_their_own_revision_without_using_fetch_head() {
+        let (temp, repo, first) = repository().await;
+        run(&repo, &["branch", "first", &first]).await.unwrap();
+        std::fs::write(repo.join("other"), "second").unwrap();
+        let second = snapshot(&repo, 2).await.unwrap();
+        run(&repo, &["branch", "second", &second]).await.unwrap();
+        let destination = temp.path().join("destination");
+        run(temp.path(), &["init", destination.to_str().unwrap()])
+            .await
+            .unwrap();
+        std::fs::write(
+            destination.join(".git/FETCH_HEAD"),
+            "another worker's fetch\n",
+        )
+        .unwrap();
+        let (a, b) = tokio::join!(
+            fetch(&destination, repo.to_str().unwrap(), "refs/heads/first"),
+            fetch(&destination, repo.to_str().unwrap(), "refs/heads/second")
+        );
+        assert_eq!(a.unwrap(), first);
+        assert_eq!(b.unwrap(), second);
+        assert_eq!(
+            std::fs::read_to_string(destination.join(".git/FETCH_HEAD")).unwrap(),
+            "another worker's fetch\n"
+        );
+        assert!(
+            run(&destination, &["for-each-ref", "refs/codex/fetch"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

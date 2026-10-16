@@ -18,6 +18,14 @@ ExecStart=/usr/local/bin/codex-discord-bot run
 Restart=on-failure
 RestartSec=10
 KillMode=control-group
+# Aggregate limits include Codex, checks, Git, and all worker descendants.
+# Tune these together with ISSUE_WORKERS_* for the VM using a systemd drop-in.
+CPUQuota=200%
+MemoryHigh=3G
+MemoryMax=4G
+TasksMax=512
+LimitNOFILE=8192
+OOMPolicy=stop
 TimeoutStopSec=20
 SendSIGKILL=yes
 UMask=0077

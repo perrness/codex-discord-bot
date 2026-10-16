@@ -161,7 +161,10 @@ impl Manager {
             .bind(session.repository_id)
             .fetch_one(&self.store.pool)
             .await?;
-            if self.take_repository_lock(&repo, session.id).is_err() {
+            // The session is terminal and unclaimed under its gate. Discard any
+            // retained shared descriptor before requesting exclusive cleanup.
+            self.drop_repository_lock(&session);
+            if self.take_repository_lock(&repo, session.id, false).is_err() {
                 continue;
             }
             let result = self.cleanup_issue_worktrees(&repo, run).await;

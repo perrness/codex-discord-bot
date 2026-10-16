@@ -45,7 +45,9 @@ pub struct Manager {
     pub(crate) provisioning_gate: AsyncMutex<()>,
     root: RepositoryRoot,
     gates: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
-    repository_locks: Mutex<HashMap<Uuid, (Uuid, File)>>,
+    // One descriptor per session: managed worktrees share the repository lock;
+    // manual checkout writers and cleanup require an exclusive descriptor.
+    repository_locks: Mutex<HashMap<Uuid, (Uuid, bool, File)>>,
     // Also allows /stop during database outages.
     live: Mutex<HashMap<u64, (String, String)>>,
     previews: Mutex<HashMap<(String, String), Value>>,
@@ -104,12 +106,12 @@ impl Manager {
             .clone()
     }
 
-    fn take_repository_lock(&self, repo: &Repository, session: Uuid) -> Result<()> {
+    fn take_repository_lock(&self, repo: &Repository, session: Uuid, isolated: bool) -> Result<()> {
         let mut locks = self.repository_locks.lock().unwrap();
-        if let Some((owner, _)) = locks.get(&repo.id) {
+        if let Some((repository, shared, _)) = locks.get(&session) {
             ensure!(
-                *owner == session,
-                "Repository already has an executing task"
+                *repository == repo.id && *shared == isolated,
+                "Session repository lock changed"
             );
             return Ok(());
         }
@@ -126,19 +128,26 @@ impl Manager {
                     .join("locks")
                     .join(format!("{}.lock", repo.name)),
             )?;
-        flock(&file, FlockOperation::NonBlockingLockExclusive)
-            .context("Repository is locked by a manual Codex session")?;
-        locks.insert(repo.id, (session, file));
+        flock(
+            &file,
+            if isolated {
+                FlockOperation::NonBlockingLockShared
+            } else {
+                FlockOperation::NonBlockingLockExclusive
+            },
+        )
+        .context("Repository is locked by another task or manual Codex session")?;
+        locks.insert(session, (repo.id, isolated, file));
         Ok(())
     }
 
     fn drop_repository_lock(&self, session: &Session) {
         let mut locks = self.repository_locks.lock().unwrap();
         if locks
-            .get(&session.repository_id)
-            .is_some_and(|(owner, _)| *owner == session.id)
+            .get(&session.id)
+            .is_some_and(|(repository, _, _)| *repository == session.repository_id)
         {
-            locks.remove(&session.repository_id);
+            locks.remove(&session.id);
         }
     }
 
@@ -228,7 +237,7 @@ impl Manager {
         let _guard = gate.lock().await;
         let mut channel_setup_started = false;
         let result = async {
-            self.take_repository_lock(&repo, session.id)?;
+            self.take_repository_lock(&repo, session.id, session.issue_run_id.is_some())?;
             self.prepare_issue_worktree(&repo, session.id).await?;
             let session = self.store.session(session.id).await?;
             self.validate_session_directory(&repo, &session).await?;
@@ -386,6 +395,11 @@ impl Manager {
     }
 
     async fn followup_locked(&self, session: &Session, source: &str, text: &str) -> Result<()> {
+        ensure!(
+            session.issue_run_id.is_none()
+                || matches!(session.status.as_str(), "running" | "waiting"),
+            "Use /dismiss, then /queue retry to restart a stopped issue. Check /queue status for its current state."
+        );
         let integrated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE r.session_id=$1)")
             .bind(session.id).fetch_one(&self.store.pool).await?;
         ensure!(
@@ -458,7 +472,9 @@ impl Manager {
                     }
                     Err(error) => return Err(error.into()),
                 }
-                if let Err(error) = self.take_repository_lock(&repo, session.id) {
+                if let Err(error) =
+                    self.take_repository_lock(&repo, session.id, session.issue_run_id.is_some())
+                {
                     sqlx::query(
                         "UPDATE sessions SET repository_claimed=false,status='idle' WHERE id=$1",
                     )
@@ -665,13 +681,16 @@ impl Manager {
                 sqlx::query("UPDATE pending_requests SET state='expired',updated_at=now() WHERE session_id=$1 AND state IN ('pending','responding')")
                     .bind(session.id).execute(&mut *tx).await?;
                 if outcome != "completed" {
+                    let next = if session.issue_run_id.is_some() {
+                        "Inspect /queue status, then /dismiss and explicitly /queue retry this issue."
+                    } else {
+                        "This task stays active; reply here to continue."
+                    };
                     persistence::enqueue(
                         &mut tx,
                         session.id,
                         &format!("{}:terminal", e.turn.id),
-                        &format!(
-                            "Turn **{outcome}**. This task stays active; reply here to continue."
-                        ),
+                        &format!("Turn **{outcome}**. {next}"),
                         None,
                     )
                     .await?;

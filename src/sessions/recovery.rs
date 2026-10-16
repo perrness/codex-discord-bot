@@ -48,7 +48,7 @@ impl Manager {
                 .fetch_one(&self.store.pool)
                 .await?;
         self.validate_session_directory(&repo, session).await?;
-        self.take_repository_lock(&repo, session.id)?;
+        self.take_repository_lock(&repo, session.id, session.issue_run_id.is_some())?;
         let resumed = self
             .client
             .resume_thread(

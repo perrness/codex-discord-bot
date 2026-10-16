@@ -56,8 +56,53 @@ pub struct Config {
     pub model: Option<String>,
     pub validation: crate::validation::Policies,
     pub integration: crate::integration::Policies,
+    pub issue_workers: IssueWorkers,
     pub approvals_reviewer: ApprovalsReviewer,
     pub rpc_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueWorkers {
+    pub global: u32,
+    pub per_repository: u32,
+}
+
+impl Default for IssueWorkers {
+    fn default() -> Self {
+        Self {
+            global: 1,
+            per_repository: 1,
+        }
+    }
+}
+
+impl IssueWorkers {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            (1..=32).contains(&self.global),
+            "ISSUE_WORKERS_GLOBAL must be 1–32"
+        );
+        ensure!(
+            (1..=32).contains(&self.per_repository),
+            "ISSUE_WORKERS_PER_REPOSITORY must be 1–32"
+        );
+        Ok(())
+    }
+
+    fn load() -> Result<Self> {
+        let workers = Self {
+            global: env::var("ISSUE_WORKERS_GLOBAL")
+                .unwrap_or_else(|_| "1".into())
+                .parse()
+                .context("Invalid ISSUE_WORKERS_GLOBAL")?,
+            per_repository: env::var("ISSUE_WORKERS_PER_REPOSITORY")
+                .unwrap_or_else(|_| "1".into())
+                .parse()
+                .context("Invalid ISSUE_WORKERS_PER_REPOSITORY")?,
+        };
+        workers.validate()?;
+        Ok(workers)
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +206,7 @@ impl Config {
                 Err(error) => return Err(error).context("Invalid CODEX_APPROVALS_REVIEWER"),
             },
             rpc_timeout: Duration::from_secs(30),
+            issue_workers: IssueWorkers::load()?,
         };
         ensure!(
             config.active_category_id != 0
@@ -283,6 +329,7 @@ mod tests {
             model: None,
             validation: Default::default(),
             integration: Default::default(),
+            issue_workers: Default::default(),
             approvals_reviewer: ApprovalsReviewer::default(),
             rpc_timeout: Duration::from_secs(1),
         };
@@ -301,5 +348,32 @@ mod tests {
         for value in ["0", "-1", "forever", "87601"] {
             assert!(retention(value).is_err());
         }
+    }
+
+    #[test]
+    fn issue_concurrency_defaults_to_one_and_is_bounded() {
+        assert_eq!(
+            IssueWorkers::default(),
+            IssueWorkers {
+                global: 1,
+                per_repository: 1
+            }
+        );
+        for (global, per_repository) in [(0, 1), (1, 0), (33, 1), (1, 33)] {
+            assert!(
+                IssueWorkers {
+                    global,
+                    per_repository
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        IssueWorkers {
+            global: 4,
+            per_repository: 2,
+        }
+        .validate()
+        .unwrap();
     }
 }

@@ -398,7 +398,20 @@ async fn release_confirmation_and_cleanup_survive_crashes_without_releasing_twic
 async fn remote_identities_and_worktree_allocations_cannot_belong_to_two_runs() -> Result<()> {
     let api = discord::Api::start().await;
     let f = Fixture::with_http(api.http.clone()).await?;
+    f.manager
+        .store
+        .configure_issue_workers(codex_discord_bot::config::IssueWorkers {
+            global: 2,
+            per_repository: 1,
+        })
+        .await?;
     let (a, _, _) = local_candidate(&f, "first").await?;
+    // Historical candidates still reserve their remote identities after a safe
+    // block permits a different local checkout to acquire the release slot.
+    f.manager
+        .store
+        .block_integration(a.id, "No publication attempted", false, true)
+        .await?;
     let (b, _, _) = local_candidate(&f, "second").await?;
     let store = &f.manager.store;
     // GitHub names are case-insensitive, including when two local registrations

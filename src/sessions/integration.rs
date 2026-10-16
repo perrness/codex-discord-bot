@@ -63,15 +63,29 @@ impl Manager {
             .parent()
             .context("Missing worktree parent")?
             .join(format!("integration-{}", run.id));
-        let i = self
-            .store
-            .begin_issue_integration(
-                run,
-                policy,
-                worktree.to_str().context("Invalid worktree path")?,
-            )
-            .await?;
+        let i = loop {
+            ensure!(
+                !cancel.is_cancelled(),
+                "Integration cancelled while waiting for release slot"
+            );
+            if let Some(i) = self
+                .store
+                .try_begin_issue_integration(
+                    run,
+                    policy,
+                    worktree.to_str().context("Invalid worktree path")?,
+                )
+                .await?
+            {
+                break i;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => bail!("Integration cancelled while waiting for release slot"),
+                _ = tokio::time::sleep(Duration::from_secs(3)) => {},
+            }
+        };
         let gh = GitHub::new(&policy.github_repository)?;
+        self.check_issue_dependencies(run).await?;
         ensure!(
             crate::github::origin(Path::new(&repo.path)).await?.as_str()
                 == policy.github_repository,
@@ -207,6 +221,7 @@ impl Manager {
         }
         // Protection's strict flag guards advancement *after* these observations.
         gh.fresh(&i).await?;
+        self.check_issue_dependencies(run).await?;
         ensure!(
             gh.branch_sha(&i.branch).await? == candidate,
             "Integration head advanced; validation is stale"

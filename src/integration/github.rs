@@ -87,6 +87,24 @@ pub(crate) struct GitHub {
     executable: PathBuf,
 }
 
+fn completed_dependency(value: &Value) -> Result<(String, i64)> {
+    let repository = value["repository_url"]
+        .as_str()
+        .and_then(|url| url.strip_prefix("https://api.github.com/repos/"))
+        .context("Dependency repository identity missing")?;
+    let repository = GitHubRepository::parse(repository)?;
+    let number = value["number"]
+        .as_i64()
+        .filter(|n| *n > 0)
+        .context("Dependency issue number missing")?;
+    ensure!(
+        value["state"] == "closed" && value["state_reason"] == "completed",
+        "Dependency {}#{number} is not completed on GitHub",
+        repository.as_str()
+    );
+    Ok((repository.as_str().to_owned(), number))
+}
+
 impl GitHub {
     pub fn new(repository: &str) -> Result<Self> {
         Ok(Self {
@@ -132,6 +150,36 @@ impl GitHub {
             .as_str()
             .context("Missing GitHub default branch")?
             .to_owned())
+    }
+
+    /// Native GitHub blocked-by relationships, including cross-repository ones.
+    /// Unknown states, incomplete pagination and API failures fail closed.
+    pub async fn completed_dependencies(&self, issue: i64) -> Result<Vec<(String, i64)>> {
+        ensure!(issue > 0, "Invalid issue number");
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let mut dependencies = Vec::new();
+            for page in 1..=100 {
+                let batch = self
+                    .api(
+                        "GET",
+                        &format!(
+                            "/issues/{issue}/dependencies/blocked_by?per_page=100&page={page}"
+                        ),
+                        None,
+                    )
+                    .await?;
+                let values = batch.as_array().context("Invalid GitHub dependency list")?;
+                for value in values {
+                    dependencies.push(completed_dependency(value)?);
+                }
+                if values.len() < 100 {
+                    return Ok(dependencies);
+                }
+            }
+            anyhow::bail!("GitHub dependency pagination limit exceeded")
+        })
+        .await
+        .context("Dependency discovery timed out")?
     }
 
     pub async fn protection(&self, branch: &str) -> Result<()> {
@@ -333,6 +381,63 @@ fn encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dependencies_require_complete_paginated_evidence_and_completed_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("gh");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+root=$(dirname "$0")
+for arg in "$@"; do case "$arg" in repos/*) endpoint=$arg ;; esac; done
+printf '%s\n' "$endpoint" >> "$root/requests"
+case "$endpoint" in
+*dependencies/blocked_by*page=1) cat "$root/first.json" ;;
+*dependencies/blocked_by*page=2) cat "$root/second.json" ;;
+*) exit 9 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut gh = GitHub::new("owner/repo").unwrap();
+        gh.executable = executable;
+        let dependency = json!({"repository_url":"https://api.github.com/repos/other/repository","number":7,"state":"closed","state_reason":"completed"});
+        let batch: Vec<_> = (0..100).map(|_| dependency.clone()).collect();
+        std::fs::write(
+            dir.path().join("first.json"),
+            serde_json::to_vec(&batch).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("second.json"), "[]").unwrap();
+        assert_eq!(gh.completed_dependencies(9).await.unwrap().len(), 100);
+        let calls = std::fs::read_to_string(dir.path().join("requests")).unwrap();
+        assert!(calls.contains("page=1") && calls.contains("page=2"));
+        for (state, reason) in [
+            ("open", "reopened"),
+            ("closed", "not_planned"),
+            ("closed", ""),
+            ("unknown", "completed"),
+        ] {
+            let mut invalid = dependency.clone();
+            invalid["state"] = state.into();
+            invalid["state_reason"] = reason.into();
+            std::fs::write(dir.path().join("second.json"), json!([invalid]).to_string()).unwrap();
+            assert!(gh.completed_dependencies(9).await.is_err());
+        }
+        for invalid in ["{}", "invalid JSON"] {
+            std::fs::write(dir.path().join("second.json"), invalid).unwrap();
+            assert!(gh.completed_dependencies(9).await.is_err());
+        }
+        std::fs::remove_file(dir.path().join("second.json")).unwrap();
+        assert!(gh.completed_dependencies(9).await.is_err());
+        assert!(
+            completed_dependency(&json!({"number":1,"state":"closed","state_reason":"completed"}))
+                .is_err()
+        );
+    }
 
     fn fixture() -> (tempfile::TempDir, GitHub, Integration) {
         use std::os::unix::fs::PermissionsExt;

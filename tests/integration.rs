@@ -31,6 +31,9 @@ mod discord;
 #[path = "support/issue_recovery.rs"]
 mod issue_recovery;
 
+#[path = "support/issue_concurrency.rs"]
+mod issue_concurrency;
+
 struct Mock {
     writer: Arc<AsyncMutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
     observed: Arc<Mutex<Vec<Value>>>,
@@ -227,6 +230,7 @@ impl Fixture {
             model: None,
             validation: Default::default(),
             integration: Default::default(),
+            issue_workers: Default::default(),
             approvals_reviewer: Default::default(),
             rpc_timeout: Duration::from_secs(1),
         });
@@ -1088,6 +1092,16 @@ async fn migration_preserves_legacy_execution_and_approval_records() -> Result<(
     sqlx::raw_sql(include_str!("../migrations/0003_task_channels.sql"))
         .execute(&mut *tx)
         .await?;
+    for migration in [
+        include_str!("../migrations/0004_github_repository.sql"),
+        include_str!("../migrations/0005_issue_queue.sql"),
+        include_str!("../migrations/0006_issue_validation.sql"),
+        include_str!("../migrations/0007_issue_integration.sql"),
+        include_str!("../migrations/0008_issue_recovery.sql"),
+        include_str!("../migrations/0009_issue_concurrency.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(&mut *tx).await?;
+    }
     let migrated: Session = sqlx::query_as("SELECT * FROM sessions WHERE id=$1")
         .bind(session)
         .fetch_one(&mut *tx)
@@ -1098,6 +1112,7 @@ async fn migration_preserves_legacy_execution_and_approval_records() -> Result<(
     assert_eq!(migrated.status, "waiting");
     assert_eq!(migrated.current_turn_id.as_deref(), Some("turn-old"));
     assert!(migrated.repository_claimed);
+    assert!(migrated.issue_run_id.is_none());
     assert!(!migrated.cleanup_due(chrono::Utc::now(), 8));
     let state: String = sqlx::query_scalar("SELECT state FROM pending_requests WHERE id=$1")
         .bind(request)
@@ -2795,5 +2810,12 @@ async fn unknown_remote_mutation_prevents_retry_even_after_session_dismissal() -
         .execute(&store.pool)
         .await?;
     assert!(store.claim_issue(run.repository_id).await?.is_none());
+    let repo = store.repository("integration-unknown").await?;
+    assert!(
+        store
+            .reserve(&repo, 42, 7, 8, "manual-bypass", None)
+            .await
+            .is_err()
+    );
     f.cleanup().await
 }

@@ -134,6 +134,10 @@ impl Manager {
             }
             sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,last_error=CASE WHEN $2='released' THEN NULL ELSE last_error END,updated_at=now() WHERE id=$1")
                 .bind(run.id).bind(if dismiss { "cancelled" } else { "released" }).execute(&mut *tx).await?;
+            // A verified release receipt is the only successful unlock. Safely
+            // blocked integrations already relinquished their slot separately.
+            sqlx::query("DELETE FROM issue_release_locks WHERE run_id=$1 AND run_id IN (SELECT id FROM confirmed_issue_releases)")
+                .bind(run.id).execute(&mut *tx).await?;
         }
         sqlx::query("UPDATE sessions SET channel_state=$2,completed_at=now(),delete_after=now()+make_interval(secs => $3::double precision),updated_at=now() WHERE id=$1")
             .bind(id).bind(state).bind(self.config.channel_retention.as_secs_f64()).execute(&mut *tx).await?;

@@ -16,6 +16,7 @@ pub struct Repository {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Session {
     pub id: Uuid,
+    pub issue_run_id: Option<Uuid>,
     pub repository_id: Uuid,
     pub requester_id: String,
     pub guild_id: String,
@@ -208,11 +209,30 @@ impl Store {
     ) -> Result<Session> {
         let id = Uuid::new_v4();
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("INSERT INTO sessions(id,repository_id,requester_id,guild_id,parent_channel_id,working_directory,status,channel_kind,channel_state,task_title) VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,$8,$9)")
-            .bind(id).bind(repo.id).bind(requester.to_string()).bind(guild.to_string()).bind(parent.to_string()).bind(&repo.path)
+        let issue: Option<Uuid> = if source.starts_with("issue:") {
+            Some(sqlx::query_scalar("SELECT id FROM issue_runs WHERE 'issue:' || id::text=$1 AND repository_id=$2 AND state='preparing' AND session_id IS NULL FOR UPDATE")
+                .bind(source).bind(repo.id).fetch_one(&mut *tx).await.context("Issue attempt is already bound or no longer preparing")?)
+        } else {
+            None
+        };
+        let directory = if let Some(run) = issue {
+            std::path::Path::new(&repo.path)
+                .parent()
+                .context("Repository has no parent")?
+                .join(".worktrees")
+                .join(&repo.name)
+                .join(run.to_string())
+                .to_str()
+                .context("Worktree path is not UTF-8")?
+                .to_owned()
+        } else {
+            repo.path.clone()
+        };
+        let result = sqlx::query("INSERT INTO sessions(id,repository_id,requester_id,guild_id,parent_channel_id,working_directory,status,channel_kind,channel_state,task_title,issue_run_id) VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,$8,$9,$10)")
+            .bind(id).bind(repo.id).bind(requester.to_string()).bind(guild.to_string()).bind(parent.to_string()).bind(&directory)
             .bind(if task_title.is_some() { "text" } else { "thread" })
             .bind(if task_title.is_some() { "provisioning" } else { "legacy" })
-            .bind(task_title.unwrap_or_default()).execute(&mut *tx).await;
+            .bind(task_title.unwrap_or_default()).bind(issue).execute(&mut *tx).await;
         if let Err(e) = result {
             if e.as_database_error()
                 .is_some_and(|e| e.is_unique_violation())
