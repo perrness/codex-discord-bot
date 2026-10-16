@@ -4,6 +4,7 @@ mod integration;
 mod recovery;
 mod releases;
 mod validation;
+mod workflow;
 use crate::persistence::Store;
 use anyhow::{Result, ensure};
 use uuid::Uuid;
@@ -13,6 +14,8 @@ pub enum State {
     Queued,
     Preparing,
     Implementing,
+    AwaitingInput,
+    Completed,
     Validating,
     Integrating,
     Releasing,
@@ -27,6 +30,8 @@ impl State {
             Self::Queued => "queued",
             Self::Preparing => "preparing",
             Self::Implementing => "implementing",
+            Self::AwaitingInput => "awaiting_input",
+            Self::Completed => "completed",
             Self::Validating => "validating",
             Self::Integrating => "integrating",
             Self::Releasing => "releasing",
@@ -42,12 +47,15 @@ impl State {
             (self, next),
             (Queued, Preparing)
                 | (Preparing, Implementing)
+                | (Implementing, AwaitingInput)
+                | (AwaitingInput, Implementing)
+                | (AwaitingInput, Completed)
                 | (Implementing, Validating)
                 | (Validating, Integrating)
                 | (Integrating, Releasing)
                 | (Releasing, Released)
         ) || (matches!(next, Blocked | Failed | Cancelled)
-            && !matches!(self, Released | Failed | Cancelled | Blocked))
+            && !matches!(self, Completed | Released | Failed | Cancelled | Blocked))
     }
 }
 #[derive(Debug, sqlx::FromRow)]
@@ -58,6 +66,7 @@ pub struct Run {
     pub issue_number: i64,
     pub attempt: i32,
     pub state: String,
+    pub workflow: String,
     pub claim_id: Option<Uuid>,
     pub session_id: Option<Uuid>,
 }
@@ -76,10 +85,26 @@ impl Store {
     }
 
     pub async fn enqueue_issue(&self, repo: Uuid, github: &str, number: i64) -> Result<()> {
+        self.enqueue_issue_with_workflow(
+            repo,
+            github,
+            number,
+            crate::config::IssueWorkflow::default(),
+        )
+        .await
+    }
+
+    pub async fn enqueue_issue_with_workflow(
+        &self,
+        repo: Uuid,
+        github: &str,
+        number: i64,
+        workflow: crate::config::IssueWorkflow,
+    ) -> Result<()> {
         ensure!(number > 0, "Invalid issue number");
         // Rediscovery never retries a failed or completed issue.
-        sqlx::query("INSERT INTO issue_runs(id,repository_id,github_repository,issue_number) SELECT $1,$2,$3,$4 WHERE NOT EXISTS(SELECT 1 FROM issue_runs WHERE repository_id=$2 AND github_repository=$3 AND issue_number=$4) ON CONFLICT DO NOTHING")
-            .bind(Uuid::new_v4()).bind(repo).bind(github).bind(number).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO issue_runs(id,repository_id,github_repository,issue_number,workflow) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM issue_runs WHERE repository_id=$2 AND github_repository=$3 AND issue_number=$4) ON CONFLICT DO NOTHING")
+            .bind(Uuid::new_v4()).bind(repo).bind(github).bind(number).bind(workflow.as_str()).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn claim_issue(&self, repo: Uuid) -> Result<Option<Run>> {
@@ -137,11 +162,11 @@ impl Store {
         dependencies: &[(String, i64)],
     ) -> Result<()> {
         for (repository, number) in dependencies {
-            let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM (SELECT DISTINCT ON (repository_id) state FROM issue_runs WHERE lower(github_repository)=lower($1) AND issue_number=$2 ORDER BY repository_id,attempt DESC) latest WHERE state <> 'released')")
+            let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM (SELECT DISTINCT ON (repository_id) state FROM issue_runs WHERE lower(github_repository)=lower($1) AND issue_number=$2 ORDER BY repository_id,attempt DESC) latest WHERE state NOT IN ('released','completed'))")
                 .bind(repository).bind(number).fetch_one(&self.pool).await?;
             ensure!(
                 !pending,
-                "Dependency {repository}#{number} has not completed its managed release"
+                "Dependency {repository}#{number} has not completed its workflow or managed release"
             );
         }
         Ok(())
@@ -154,7 +179,7 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         ensure!(from.permits(to), "Invalid issue state transition");
-        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs)) AND ($4 NOT IN ('releasing','released') OR id IN (SELECT id FROM integrated_issue_runs)) AND ($4 <> 'released' OR id IN (SELECT id FROM confirmed_issue_releases))")
+        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs)) AND ($4 NOT IN ('releasing','released') OR id IN (SELECT id FROM integrated_issue_runs)) AND ($4 <> 'released' OR id IN (SELECT id FROM confirmed_issue_releases)) AND ($4 NOT IN ('awaiting_input','completed') OR workflow='repository') AND ($4 <> 'completed' OR id IN (SELECT run_id FROM issue_workflow_completions))")
             .bind(run.id).bind(run.claim_id).bind(from.as_str()).bind(to.as_str()).bind(error).execute(&self.pool).await?.rows_affected();
         ensure!(changed == 1, "Stale issue claim or state");
         Ok(())
@@ -169,6 +194,16 @@ impl Store {
         Ok(())
     }
     pub async fn retry_issue(&self, repo: Uuid, number: i64) -> Result<()> {
+        self.retry_issue_with_workflow(repo, number, crate::config::IssueWorkflow::default())
+            .await
+    }
+
+    pub async fn retry_issue_with_workflow(
+        &self,
+        repo: Uuid,
+        number: i64,
+        workflow: crate::config::IssueWorkflow,
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT repository_id FROM issue_queues WHERE repository_id=$1 FOR UPDATE")
             .bind(repo)
@@ -176,6 +211,16 @@ impl Store {
             .await?;
         let old: Run = sqlx::query_as("SELECT * FROM issue_runs WHERE repository_id=$1 AND issue_number=$2 ORDER BY attempt DESC LIMIT 1 FOR UPDATE")
             .bind(repo).bind(number).fetch_one(&mut *tx).await?;
+        let completed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM issue_workflow_completions WHERE run_id=$1)",
+        )
+        .bind(old.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        ensure!(
+            !completed,
+            "Completed repository workflows cannot be retried"
+        );
         let unsafe_integration: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_integrations WHERE run_id=$1 AND (state <> 'blocked' OR NOT retry_safe OR merge_sha IS NOT NULL))")
             .bind(old.id).fetch_one(&mut *tx).await?;
         ensure!(
@@ -201,8 +246,8 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         let next = Uuid::new_v4();
-        sqlx::query("INSERT INTO issue_runs(id,repository_id,github_repository,issue_number,attempt) VALUES($1,$2,$3,$4,$5)")
-            .bind(next).bind(repo).bind(old.github_repository).bind(number).bind(old.attempt+1).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO issue_runs(id,repository_id,github_repository,issue_number,attempt,workflow) VALUES($1,$2,$3,$4,$5,$6)")
+            .bind(next).bind(repo).bind(old.github_repository).bind(number).bind(old.attempt+1).bind(workflow.as_str()).execute(&mut *tx).await?;
         if let Some(session) = old.session_id {
             crate::persistence::enqueue(&mut tx, session, &format!("issue-retry:{next}"),
                 &format!("Issue #{number}: attempt {} queued as `{next}`. The previous worktrees are preserved. Dispatch follows the queue's pause setting.", old.attempt + 1), None).await?;
@@ -218,6 +263,10 @@ mod tests {
     fn transitions_require_validation_and_never_replay_terminal_work() {
         assert!(Queued.permits(Preparing));
         assert!(Preparing.permits(Implementing));
+        assert!(Implementing.permits(AwaitingInput));
+        assert!(AwaitingInput.permits(Implementing));
+        assert!(AwaitingInput.permits(Completed));
+        assert!(!Implementing.permits(Completed));
         assert!(Implementing.permits(Validating));
         assert!(Validating.permits(Integrating));
         assert!(Integrating.permits(Releasing));
@@ -226,6 +275,7 @@ mod tests {
             Queued,
             Preparing,
             Implementing,
+            AwaitingInput,
             Validating,
             Integrating,
             Releasing,
@@ -235,7 +285,7 @@ mod tests {
             assert!(state.permits(Cancelled));
         }
         assert!(!Implementing.permits(Released));
-        for state in [Released, Blocked, Failed, Cancelled] {
+        for state in [Completed, Released, Blocked, Failed, Cancelled] {
             assert!(!state.permits(Preparing));
         }
     }

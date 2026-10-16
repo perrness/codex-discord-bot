@@ -67,9 +67,15 @@ impl Manager {
             dismiss || session.last_outcome.as_deref() == Some("completed"),
             "The last turn did not succeed; continue the task or explicitly /dismiss it"
         );
-        if !dismiss {
+        let repository_workflow: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1 AND workflow='repository')",
+        )
+        .bind(id)
+        .fetch_one(&self.store.pool)
+        .await?;
+        if !dismiss && !repository_workflow {
             self.store.require_issue_release(id).await?;
-        } else {
+        } else if dismiss {
             let integration: Option<crate::integration::Integration> = sqlx::query_as("SELECT i.* FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE r.session_id=$1")
                 .bind(id).fetch_optional(&self.store.pool).await?;
             if let Some(i) = integration {
@@ -118,7 +124,26 @@ impl Manager {
                 .await?;
         let is_issue = issue.is_some();
         if let Some(run) = issue {
-            if !dismiss {
+            if repository_workflow {
+                let managed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_integrations WHERE run_id=$1) OR EXISTS(SELECT 1 FROM issue_releases WHERE run_id=$1)")
+                    .bind(run.id).fetch_one(&mut *tx).await?;
+                ensure!(
+                    !managed,
+                    "Managed integration or release evidence requires reconciliation"
+                );
+                if !dismiss {
+                    ensure!(
+                        matches!(run.state.as_str(), "awaiting_input" | "completed"),
+                        "The repository workflow has not finished a successful turn; inspect /queue status"
+                    );
+                    sqlx::query("INSERT INTO issue_workflow_completions(run_id,confirmed_by) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                        .bind(run.id).bind(user.to_string()).execute(&mut *tx).await?;
+                }
+                sqlx::query("DELETE FROM issue_release_locks WHERE run_id=$1")
+                    .bind(run.id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else if !dismiss {
                 // /complete can close presentation again after /reconnect, but
                 // cannot manufacture deployment evidence or a release receipt.
                 ensure!(
@@ -126,16 +151,25 @@ impl Manager {
                     "Release is not independently verified"
                 );
             }
-            sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,last_error=CASE WHEN $2='released' THEN NULL ELSE last_error END,updated_at=now() WHERE id=$1")
-                .bind(run.id).bind(if dismiss { "cancelled" } else { "released" }).execute(&mut *tx).await?;
-            // A verified release receipt is the only successful unlock. Safely
+            let next = if repository_workflow && (!dismiss || run.state == "completed") {
+                "completed"
+            } else if dismiss {
+                "cancelled"
+            } else {
+                "released"
+            };
+            sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,last_error=CASE WHEN $2 IN ('released','completed') THEN NULL ELSE last_error END,updated_at=now() WHERE id=$1")
+                .bind(run.id).bind(next).execute(&mut *tx).await?;
+            // Managed releases still require a verified receipt. Safely
             // blocked integrations already relinquished their slot separately.
             sqlx::query("DELETE FROM issue_release_locks WHERE run_id=$1 AND run_id IN (SELECT id FROM confirmed_issue_releases)")
                 .bind(run.id).execute(&mut *tx).await?;
         }
         sqlx::query("UPDATE sessions SET channel_state=$2,completed_at=now(),delete_after=now()+make_interval(secs => $3::double precision),updated_at=now() WHERE id=$1")
             .bind(id).bind(state).bind(self.config.channel_retention.as_secs_f64()).execute(&mut *tx).await?;
-        let next = if is_issue {
+        let next = if repository_workflow {
+            "The issue worktree and branch are preserved."
+        } else if is_issue {
             "Issue worktrees are preserved on failure; clean worktrees are eligible for cleanup after release confirmation."
         } else {
             "Reply before then to reopen it."

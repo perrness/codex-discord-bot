@@ -208,6 +208,15 @@ impl Manager {
             }
             _ => bail!("Unknown action"),
         };
+        if matches!(action, "accept" | "answer") {
+            let repository_workflow: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1 AND workflow='repository')")
+                .bind(request.session_id).fetch_one(&self.store.pool).await?;
+            if repository_workflow {
+                self.store
+                    .claim_issue_workflow(request.session_id, "", true)
+                    .await?;
+            }
+        }
         let changed = sqlx::query("UPDATE pending_requests SET state='responding',updated_at=now() WHERE id=$1 AND state='pending' AND generation=$2")
             .bind(id).bind(self.generation).execute(&self.store.pool).await?.rows_affected();
         ensure!(changed == 1, "This request was already answered");

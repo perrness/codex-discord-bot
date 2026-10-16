@@ -64,6 +64,59 @@ async fn pass_checks(store: &Store, run: &Run) -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
+async fn default_workers_allow_three_repositories_with_one_issue_each() -> Result<()> {
+    let f = Fixture::new().await?;
+    let store = &f.manager.store;
+    let a = queue(&f, "alpha", 2).await?;
+    let b = queue(&f, "beta", 2).await?;
+    let c = queue(&f, "gamma", 2).await?;
+    let d = queue(&f, "delta", 2).await?;
+    let claims = futures_util::future::join_all(
+        [a.id, b.id, c.id, a.id, b.id, c.id].map(|repo| store.claim_issue(repo)),
+    )
+    .await;
+    let claims: Vec<Run> = claims
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(claims.len(), 3);
+    for repo in [a.id, b.id, c.id] {
+        let runs: Vec<_> = claims
+            .iter()
+            .filter(|run| run.repository_id == repo)
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].issue_number, 1);
+        assert!(store.claim_issue(repo).await?.is_none());
+    }
+    assert!(store.claim_issue(d.id).await?.is_none());
+
+    let a_run = claims.iter().find(|run| run.repository_id == a.id).unwrap();
+    store
+        .transition_issue(a_run, State::Preparing, State::Blocked, Some("inspect"))
+        .await?;
+    assert!(store.claim_issue(d.id).await?.is_none());
+    let b_run = claims.iter().find(|run| run.repository_id == b.id).unwrap();
+    store
+        .transition_issue(b_run, State::Preparing, State::Cancelled, None)
+        .await?;
+    assert!(store.claim_issue(a.id).await?.is_none());
+    assert!(store.claim_issue(c.id).await?.is_none());
+    let next = store.claim_issue(d.id).await?.unwrap();
+    assert_eq!(next.issue_number, 1);
+    assert!(store.claim_issue(b.id).await?.is_none());
+    let status = f
+        .manager
+        .queue_command("status", "delta", 42, 7, None)
+        .await?;
+    assert!(status.contains("3/3 global · 1/1 repository"));
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
 async fn concurrent_admission_enforces_global_and_repository_limits() -> Result<()> {
     let f = Fixture::new().await?;
     let store = &f.manager.store;

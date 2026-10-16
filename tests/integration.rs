@@ -34,6 +34,9 @@ mod issue_recovery;
 #[path = "support/issue_concurrency.rs"]
 mod issue_concurrency;
 
+#[path = "support/repository_workflow.rs"]
+mod repository_workflow;
+
 #[path = "support/issue_releases.rs"]
 mod issue_releases;
 
@@ -235,9 +238,11 @@ impl Fixture {
             validation: Default::default(),
             integration: Default::default(),
             issue_workers: Default::default(),
+            issue_workflow: Default::default(),
             approvals_reviewer: Default::default(),
             rpc_timeout: Duration::from_secs(1),
         });
+        store.configure_issue_workers(config.issue_workers).await?;
         let (mock, client, events) = Mock::new();
         let manager = Arc::new(Manager::new(config, store, client, Uuid::new_v4(), http)?);
         let dispatch = tokio::spawn(manager.clone().dispatch(events));
@@ -1104,6 +1109,7 @@ async fn migration_preserves_legacy_execution_and_approval_records() -> Result<(
         include_str!("../migrations/0008_issue_recovery.sql"),
         include_str!("../migrations/0009_issue_concurrency.sql"),
         include_str!("../migrations/0010_issue_releases.sql"),
+        include_str!("../migrations/0011_repository_workflow.sql"),
     ] {
         sqlx::raw_sql(migration).execute(&mut *tx).await?;
     }
@@ -1972,6 +1978,7 @@ async fn issue_queue_serializes_claims_and_requires_explicit_retry_after_restart
         issue_number: run.issue_number,
         attempt: run.attempt,
         state: run.state.clone(),
+        workflow: run.workflow.clone(),
         session_id: run.session_id,
         claim_id: Some(Uuid::new_v4()),
     };
@@ -2229,7 +2236,7 @@ fn validation_results() -> Vec<codex_discord_bot::validation::CheckResult> {
 async fn validating(store: &Store, run: &codex_discord_bot::queue::Run) -> Result<()> {
     sqlx::query("UPDATE sessions SET status='validating',repository_claimed=true,current_turn_id=NULL,last_outcome='completed' WHERE id=$1")
         .bind(run.session_id).execute(&store.pool).await?;
-    sqlx::query("UPDATE issue_runs SET state='validating' WHERE id=$1")
+    sqlx::query("UPDATE issue_runs SET state='validating',workflow='managed' WHERE id=$1")
         .bind(run.id)
         .execute(&store.pool)
         .await?;
@@ -2238,10 +2245,14 @@ async fn validating(store: &Store, run: &codex_discord_bot::queue::Run) -> Resul
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
-async fn completed_issue_turn_without_trusted_checks_blocks_completion() -> Result<()> {
+async fn managed_issue_turn_without_trusted_checks_blocks_completion() -> Result<()> {
     let api = discord::Api::start().await;
     let f = Fixture::with_http(api.http.clone()).await?;
     let (run, session) = f.issue_task("missing-checks").await?;
+    sqlx::query("UPDATE issue_runs SET workflow='managed' WHERE id=$1")
+        .bind(run.id)
+        .execute(&f.manager.store.pool)
+        .await?;
     f.mock
         .send(
             json!({"method":"item/completed","params":{"threadId":session.codex_thread_id,
@@ -2287,6 +2298,12 @@ async fn completed_issue_turn_without_trusted_checks_blocks_completion() -> Resu
     );
     f.manager.finish_task(42, 7, session.id, true).await?;
     f.manager.store.retry_issue(run.repository_id, 5).await?;
+    let workflow: String = sqlx::query_scalar("SELECT workflow FROM issue_runs WHERE repository_id=$1 AND issue_number=5 ORDER BY attempt DESC LIMIT 1")
+        .bind(run.repository_id).fetch_one(&f.manager.store.pool).await?;
+    assert_eq!(
+        workflow, "repository",
+        "A fresh retry uses the new default instead of inheriting a missing-policy block"
+    );
     f.cleanup().await
 }
 

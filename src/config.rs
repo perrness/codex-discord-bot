@@ -5,6 +5,34 @@ use anyhow::{Context, Result, ensure};
 pub const SUPPORTED_CODEX_VERSION: &str = "0.162.1";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IssueWorkflow {
+    #[default]
+    Repository,
+    Managed,
+}
+
+impl IssueWorkflow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Managed => "managed",
+        }
+    }
+}
+
+impl std::str::FromStr for IssueWorkflow {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "repository" => Ok(Self::Repository),
+            "managed" => Ok(Self::Managed),
+            _ => anyhow::bail!("ISSUE_WORKFLOW must be repository or managed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ApprovalsReviewer {
     #[default]
     AutoReview,
@@ -58,6 +86,7 @@ pub struct Config {
     pub validation: crate::validation::Policies,
     pub integration: crate::integration::Policies,
     pub issue_workers: IssueWorkers,
+    pub issue_workflow: IssueWorkflow,
     pub approvals_reviewer: ApprovalsReviewer,
     pub rpc_timeout: Duration,
 }
@@ -71,7 +100,7 @@ pub struct IssueWorkers {
 impl Default for IssueWorkers {
     fn default() -> Self {
         Self {
-            global: 1,
+            global: 3,
             per_repository: 1,
         }
     }
@@ -91,13 +120,14 @@ impl IssueWorkers {
     }
 
     fn load() -> Result<Self> {
+        let defaults = Self::default();
         let workers = Self {
             global: env::var("ISSUE_WORKERS_GLOBAL")
-                .unwrap_or_else(|_| "1".into())
+                .unwrap_or_else(|_| defaults.global.to_string())
                 .parse()
                 .context("Invalid ISSUE_WORKERS_GLOBAL")?,
             per_repository: env::var("ISSUE_WORKERS_PER_REPOSITORY")
-                .unwrap_or_else(|_| "1".into())
+                .unwrap_or_else(|_| defaults.per_repository.to_string())
                 .parse()
                 .context("Invalid ISSUE_WORKERS_PER_REPOSITORY")?,
         };
@@ -204,6 +234,11 @@ impl Config {
                 Ok(_) | Err(env::VarError::NotPresent) => Default::default(),
                 Err(error) => return Err(error).context("Invalid INTEGRATION_CONFIG"),
             },
+            issue_workflow: match env::var("ISSUE_WORKFLOW") {
+                Ok(value) => value.parse()?,
+                Err(env::VarError::NotPresent) => IssueWorkflow::default(),
+                Err(error) => return Err(error).context("Invalid ISSUE_WORKFLOW"),
+            },
             approvals_reviewer: match env::var("CODEX_APPROVALS_REVIEWER") {
                 Ok(value) => value.parse()?,
                 Err(env::VarError::NotPresent) => ApprovalsReviewer::default(),
@@ -281,6 +316,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repository_workflow_is_the_default_and_managed_is_explicit() {
+        assert_eq!(IssueWorkflow::default(), IssueWorkflow::Repository);
+        assert_eq!(
+            "repository".parse::<IssueWorkflow>().unwrap().as_str(),
+            "repository"
+        );
+        assert_eq!(
+            "managed".parse::<IssueWorkflow>().unwrap(),
+            IssueWorkflow::Managed
+        );
+        assert!("automatic".parse::<IssueWorkflow>().is_err());
+    }
+
+    #[test]
     fn reviewer_defaults_to_auto_review_and_rejects_unknown_modes() {
         assert_eq!(ApprovalsReviewer::default(), ApprovalsReviewer::AutoReview);
         assert_eq!(
@@ -335,6 +384,7 @@ mod tests {
             validation: Default::default(),
             integration: Default::default(),
             issue_workers: Default::default(),
+            issue_workflow: Default::default(),
             approvals_reviewer: ApprovalsReviewer::default(),
             rpc_timeout: Duration::from_secs(1),
         };
@@ -356,11 +406,11 @@ mod tests {
     }
 
     #[test]
-    fn issue_concurrency_defaults_to_one_and_is_bounded() {
+    fn issue_concurrency_defaults_to_three_global_and_one_per_repository_and_is_bounded() {
         assert_eq!(
             IssueWorkers::default(),
             IssueWorkers {
-                global: 1,
+                global: 3,
                 per_repository: 1
             }
         );

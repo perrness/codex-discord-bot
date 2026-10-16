@@ -300,7 +300,7 @@ impl Manager {
             .bind(session.id).execute(&mut *tx).await?;
         // Invalidate evidence before any new turn can change the worktree. Persist
         // implementing before submission so a fast completion cannot race dispatch.
-        sqlx::query("UPDATE issue_runs SET validation_id=NULL,state=CASE WHEN state IN ('preparing','integrating','releasing','released') THEN 'implementing' ELSE state END,updated_at=now() WHERE session_id=$1")
+        sqlx::query("UPDATE issue_runs SET validation_id=NULL,state=CASE WHEN state IN ('preparing','awaiting_input','integrating','releasing','released') THEN 'implementing' ELSE state END,updated_at=now() WHERE session_id=$1")
             .bind(session.id).execute(&mut *tx).await?;
         tx.commit().await?;
         let turn = match self
@@ -397,9 +397,23 @@ impl Manager {
     }
 
     async fn followup_locked(&self, session: &Session, source: &str, text: &str) -> Result<()> {
+        let issue: Option<crate::queue::Run> =
+            sqlx::query_as("SELECT * FROM issue_runs WHERE session_id=$1")
+                .bind(session.id)
+                .fetch_optional(&self.store.pool)
+                .await?;
+        let repository_workflow = issue
+            .as_ref()
+            .is_some_and(|run| run.workflow == "repository");
         ensure!(
             session.issue_run_id.is_none()
-                || matches!(session.status.as_str(), "running" | "waiting"),
+                || matches!(session.status.as_str(), "running" | "waiting")
+                || (repository_workflow
+                    && issue
+                        .as_ref()
+                        .is_some_and(|run| run.state == "awaiting_input")
+                    && session.status == "idle"
+                    && !session.terminal_task()),
             "Use /dismiss, then /queue retry to restart a stopped issue. Check /queue status for its current state."
         );
         let integrated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE r.session_id=$1)")
@@ -408,6 +422,16 @@ impl Manager {
             !integrated,
             "This issue's integration candidate is immutable. Inspect /queue status; dismiss a safely blocked attempt and use /queue retry for changes"
         );
+        let instructions;
+        let text = if repository_workflow && session.status != "waiting" {
+            self.store
+                .claim_issue_workflow(session.id, source, false)
+                .await?;
+            instructions = queue::repository_followup(text);
+            instructions.as_str()
+        } else {
+            text
+        };
         if session.terminal_task() {
             // An authorized follow-up cancels retention or restores a dismissed legacy thread
             // to the list even if another repository owner or unavailable history blocks resuming.
@@ -673,13 +697,40 @@ impl Manager {
                 self.deliver_response(&session, &e.turn.id).await?;
                 let mut tx = self.store.pool.begin().await?;
                 let validation: Option<crate::queue::Run> = if outcome == "completed" {
-                    sqlx::query_as("UPDATE issue_runs SET state='validating',updated_at=now() WHERE session_id=$1 AND state='implementing' RETURNING *")
+                    sqlx::query_as("UPDATE issue_runs SET state='validating',updated_at=now() WHERE session_id=$1 AND state='implementing' AND workflow='managed' RETURNING *")
                         .bind(session.id).fetch_optional(&mut *tx).await?
                 } else {
                     sqlx::query("UPDATE issue_runs SET state='blocked',validation_id=NULL,last_error=$2,updated_at=now() WHERE session_id=$1 AND state IN ('preparing','implementing')")
                         .bind(session.id).bind(format!("Codex turn {outcome}; explicit review and retry required")).execute(&mut *tx).await?;
                     None
                 };
+                if outcome == "completed" {
+                    let ready: Option<Uuid> = sqlx::query_scalar("UPDATE issue_runs SET state='awaiting_input',last_error=NULL,updated_at=now() WHERE session_id=$1 AND state='implementing' AND workflow='repository' RETURNING id")
+                        .bind(session.id).fetch_optional(&mut *tx).await?;
+                    if let Some(run) = ready {
+                        let continued: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM issue_release_locks WHERE run_id=$1)",
+                        )
+                        .bind(run)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        let message = if continued {
+                            "Turn finished. Your instructions remain in this conversation. Reply here if more work is needed, or use /complete after the approved workflow is finished."
+                        } else {
+                            "Ready for your review. Reply here to approve the commit/push/merge/release workflow or request changes. Codex follows this repository's review process, if any. Use /complete after the requested workflow is finished."
+                        };
+                        sqlx::query("UPDATE sessions SET status_snapshot=jsonb_set(status_snapshot,'{activity}',to_jsonb($2::text)) WHERE id=$1")
+                            .bind(session.id).bind(message).execute(&mut *tx).await?;
+                        persistence::enqueue(
+                            &mut tx,
+                            session.id,
+                            &format!("issue-input:{run}:{}", e.turn.id),
+                            message,
+                            None,
+                        )
+                        .await?;
+                    }
+                }
                 sqlx::query("UPDATE sessions SET status=$4,repository_claimed=$5,current_turn_id=NULL,last_outcome=$2,last_error=$3,updated_at=now() WHERE id=$1")
                     .bind(session.id).bind(outcome).bind(if outcome == "failed" { Some("Codex turn failed; check the task output and service logs") } else { None })
                     .bind(if validation.is_some() { "validating" } else { "idle" }).bind(validation.is_some()).execute(&mut *tx).await?;

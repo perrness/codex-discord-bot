@@ -342,6 +342,7 @@ fn needs_attention(key: &str, interactive: bool) -> bool {
             "release-succeeded:",
             "issue-recovery:",
             "issue-retry:",
+            "issue-input:",
             "issue-cleanup:",
         ]
         .iter()
