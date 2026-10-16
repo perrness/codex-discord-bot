@@ -72,8 +72,13 @@ async fn check_thread_policy(binary: &str, reviewer: ApprovalsReviewer) -> Resul
         let auth: Value = client.request("account/read", json!({"refreshToken":false})).await?;
         ensure!(auth["account"].is_null(), "Test unexpectedly accessed credentials");
         // Verify both reviewers with the same effective cwd, sandbox and network restrictions.
-        let thread = client.start_thread(repo.to_str().unwrap(), None, reviewer).await?;
+        let thread = client.start_thread(repo.to_str().unwrap(), None, None, reviewer).await?;
         ensure!(!thread.thread.id.is_empty(), "Missing Codex thread ID");
+        client.clean_terminals(&thread.thread.id).await?;
+        // Exercise the real protocol's model and config override fields without inference.
+        let thread = client.start_thread(repo.to_str().unwrap(), Some("gpt-6-astra"), Some("max"), reviewer).await?;
+        ensure!(thread.model.as_deref() == Some("gpt-6-astra"), "Model override was lost");
+        ensure!(thread.reasoning_effort.as_deref() == Some("max"), "Effort override was lost");
         client.clean_terminals(&thread.thread.id).await?;
         Ok::<_, anyhow::Error>(())
     }.await;

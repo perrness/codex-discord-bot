@@ -192,11 +192,14 @@ impl Client {
         &self,
         cwd: &str,
         model: Option<&str>,
+        reasoning_effort: Option<&str>,
         reviewer: ApprovalsReviewer,
     ) -> Result<ThreadResponse> {
         let result: ThreadResponse = self.request("thread/start", json!({"cwd":cwd,"model":model,
+            "config":reasoning_effort.map(|effort| json!({"model_reasoning_effort":effort})),
             "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":reviewer.as_str(),"ephemeral":false})).await?;
         verify_policy(&result, cwd, reviewer)?;
+        verify_model_settings(&result, model, reasoning_effort)?;
         Ok(result)
     }
 
@@ -204,16 +207,20 @@ impl Client {
         &self,
         thread: &str,
         cwd: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
         reviewer: ApprovalsReviewer,
     ) -> Result<ThreadResponse> {
         let result: ThreadResponse = self
             .request(
                 "thread/resume",
-                json!({"threadId":thread,"cwd":cwd,"excludeTurns":true,
+                json!({"threadId":thread,"cwd":cwd,"excludeTurns":true,"model":model,
+            "config":reasoning_effort.map(|effort| json!({"model_reasoning_effort":effort})),
             "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":reviewer.as_str()}),
             )
             .await?;
         verify_policy(&result, cwd, reviewer)?;
+        verify_model_settings(&result, model, reasoning_effort)?;
         Ok(result)
     }
 
@@ -223,9 +230,11 @@ impl Client {
         text: &str,
         cwd: &str,
         source_id: &str,
+        reasoning_effort: Option<&str>,
         reviewer: ApprovalsReviewer,
     ) -> Result<TurnResponse, RpcError> {
         self.request("turn/start", json!({"threadId":thread,"input":[{"type":"text","text":text}],
+            "effort":reasoning_effort,
             "clientUserMessageId":source_id,"cwd":cwd,"approvalPolicy":"on-request","approvalsReviewer":reviewer.as_str(),
             "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false,
                 "excludeSlashTmp":false,"excludeTmpdirEnvVar":false}})).await
@@ -268,6 +277,26 @@ impl Client {
     }
 }
 
+fn verify_model_settings(
+    r: &ThreadResponse,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> Result<()> {
+    if let Some(model) = model {
+        ensure!(
+            r.model.as_deref() == Some(model),
+            "Codex did not apply the configured model ({model})"
+        );
+    }
+    if let Some(effort) = reasoning_effort {
+        ensure!(
+            r.reasoning_effort.as_deref() == Some(effort),
+            "Codex did not apply the configured reasoning effort ({effort})"
+        );
+    }
+    Ok(())
+}
+
 fn verify_policy(r: &ThreadResponse, cwd: &str, reviewer: ApprovalsReviewer) -> Result<()> {
     ensure!(
         r.cwd == cwd && r.thread.cwd == cwd,
@@ -300,58 +329,101 @@ mod tests {
 
     fn thread_response(reviewer: ApprovalsReviewer) -> Value {
         json!({"thread":{"id":"thread-1","cwd":"/repos/test","status":{"type":"idle"}},
+            "model":"gpt-6-astra","reasoningEffort":"max",
             "cwd":"/repos/test","approvalPolicy":"on-request","approvalsReviewer":reviewer.as_str(),
             "sandbox":{"type":"workspaceWrite","networkAccess":false,"writableRoots":[]}})
     }
 
     #[tokio::test]
-    async fn reviewer_is_sent_for_new_resumed_and_continued_work() {
-        for reviewer in [ApprovalsReviewer::AutoReview, ApprovalsReviewer::User] {
-            let (a, b) = tokio::io::duplex(16384);
-            let (ar, aw) = tokio::io::split(a);
-            let (br, mut bw) = tokio::io::split(b);
-            let (client, _events) = Client::connect(ar, aw, Duration::from_secs(2));
-            let server = tokio::spawn(async move {
-                let mut lines = BufReader::new(br).lines();
-                for method in ["thread/start", "thread/resume", "turn/start"] {
-                    let line = lines.next_line().await.unwrap().unwrap();
-                    let request: Value = serde_json::from_str(&line).unwrap();
-                    assert_eq!(request["method"], method);
-                    assert_eq!(request["params"]["approvalsReviewer"], reviewer.as_str());
-                    assert_eq!(request["params"]["approvalPolicy"], "on-request");
-                    assert_eq!(request["params"]["cwd"], "/repos/test");
-                    let result = if method == "turn/start" {
-                        assert_eq!(request["params"]["sandboxPolicy"]["type"], "workspaceWrite");
-                        assert_eq!(request["params"]["sandboxPolicy"]["networkAccess"], false);
-                        assert_eq!(
-                            request["params"]["sandboxPolicy"]["writableRoots"],
-                            json!([])
-                        );
-                        json!({"turn":{"id":"turn-1","status":"inProgress"}})
-                    } else {
-                        assert_eq!(request["params"]["sandbox"], "workspace-write");
-                        thread_response(reviewer)
-                    };
-                    bw.write_all(
-                        format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+    async fn configured_settings_are_sent_for_new_resumed_and_continued_work() {
+        for (model, effort) in [
+            (None, None),
+            (Some("gpt-6-astra"), None),
+            (None, Some("max")),
+            (Some("gpt-6-astra"), Some("max")),
+        ] {
+            for reviewer in [ApprovalsReviewer::AutoReview, ApprovalsReviewer::User] {
+                let (a, b) = tokio::io::duplex(16384);
+                let (ar, aw) = tokio::io::split(a);
+                let (br, mut bw) = tokio::io::split(b);
+                let (client, _events) = Client::connect(ar, aw, Duration::from_secs(2));
+                let server = tokio::spawn(async move {
+                    let mut lines = BufReader::new(br).lines();
+                    for method in ["thread/start", "thread/resume", "turn/start"] {
+                        let line = lines.next_line().await.unwrap().unwrap();
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(request["method"], method);
+                        assert_eq!(request["params"]["approvalsReviewer"], reviewer.as_str());
+                        assert_eq!(request["params"]["approvalPolicy"], "on-request");
+                        assert_eq!(request["params"]["cwd"], "/repos/test");
+                        let result = if method == "turn/start" {
+                            assert_eq!(request["params"]["effort"], json!(effort));
+                            assert_eq!(
+                                request["params"]["sandboxPolicy"]["type"],
+                                "workspaceWrite"
+                            );
+                            assert_eq!(request["params"]["sandboxPolicy"]["networkAccess"], false);
+                            assert_eq!(
+                                request["params"]["sandboxPolicy"]["writableRoots"],
+                                json!([])
+                            );
+                            json!({"turn":{"id":"turn-1","status":"inProgress"}})
+                        } else {
+                            assert_eq!(request["params"]["model"], json!(model));
+                            assert_eq!(
+                                request["params"]["config"],
+                                json!(effort.map(|value| json!({"model_reasoning_effort":value})))
+                            );
+                            assert_eq!(request["params"]["sandbox"], "workspace-write");
+                            thread_response(reviewer)
+                        };
+                        bw.write_all(
+                            format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+                client
+                    .start_thread("/repos/test", model, effort, reviewer)
+                    .await
+                    .unwrap();
+                client
+                    .resume_thread("thread-1", "/repos/test", model, effort, reviewer)
+                    .await
+                    .unwrap();
+                client
+                    .start_turn(
+                        "thread-1",
+                        "Continue",
+                        "/repos/test",
+                        "message-1",
+                        effort,
+                        reviewer,
                     )
                     .await
                     .unwrap();
-                }
-            });
-            client
-                .start_thread("/repos/test", None, reviewer)
-                .await
-                .unwrap();
-            client
-                .resume_thread("thread-1", "/repos/test", reviewer)
-                .await
-                .unwrap();
-            client
-                .start_turn("thread-1", "Continue", "/repos/test", "message-1", reviewer)
-                .await
-                .unwrap();
-            server.await.unwrap();
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_model_settings_require_confirmation_from_codex() {
+        let response = thread_response(ApprovalsReviewer::AutoReview);
+        let parsed = serde_json::from_value(response.clone()).unwrap();
+        assert!(verify_model_settings(&parsed, Some("gpt-6-astra"), Some("max")).is_ok());
+        for (field, value) in [
+            ("model", json!("gpt-6.1-sol")),
+            ("model", Value::Null),
+            ("reasoningEffort", json!("medium")),
+            ("reasoningEffort", Value::Null),
+        ] {
+            let mut altered = response.clone();
+            altered[field] = value;
+            let parsed = serde_json::from_value(altered).unwrap();
+            assert!(verify_model_settings(&parsed, Some("gpt-6-astra"), Some("max")).is_err());
+            assert!(verify_model_settings(&parsed, None, None).is_ok());
         }
     }
 

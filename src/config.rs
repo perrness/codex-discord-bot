@@ -54,6 +54,7 @@ pub struct Config {
     pub codex_home: PathBuf,
     pub tool_path: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub validation: crate::validation::Policies,
     pub integration: crate::integration::Policies,
     pub issue_workers: IssueWorkers,
@@ -186,6 +187,9 @@ impl Config {
             codex_home: path("CODEX_HOME", None)?,
             tool_path: required("TOOL_PATH")?,
             model: env::var("CODEX_MODEL").ok().filter(|v| !v.is_empty()),
+            reasoning_effort: env::var("CODEX_REASONING_EFFORT")
+                .ok()
+                .filter(|v| !v.is_empty()),
             validation: match env::var("VALIDATION_CONFIG") {
                 Ok(path) if !path.is_empty() => {
                     crate::validation::Policies::load(std::path::Path::new(&path))?
@@ -327,6 +331,7 @@ mod tests {
             codex_bin: "/unused".into(),
             tool_path: "/usr/bin:/bin".into(),
             model: None,
+            reasoning_effort: None,
             validation: Default::default(),
             integration: Default::default(),
             issue_workers: Default::default(),

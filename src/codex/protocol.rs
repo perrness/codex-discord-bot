@@ -23,6 +23,10 @@ pub struct Thread {
 pub struct ThreadResponse {
     pub thread: Thread,
     pub cwd: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub approval_policy: Value,
     pub approvals_reviewer: String,
     pub sandbox: Value,

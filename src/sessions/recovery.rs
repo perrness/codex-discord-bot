@@ -54,6 +54,8 @@ impl Manager {
             .resume_thread(
                 thread,
                 &session.working_directory,
+                self.config.model.as_deref(),
+                self.config.reasoning_effort.as_deref(),
                 self.config.approvals_reviewer,
             )
             .await?;

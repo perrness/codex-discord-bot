@@ -231,6 +231,7 @@ impl Fixture {
             codex_bin: "/not-used".into(),
             tool_path: "/usr/bin:/bin".into(),
             model: None,
+            reasoning_effort: None,
             validation: Default::default(),
             integration: Default::default(),
             issue_workers: Default::default(),

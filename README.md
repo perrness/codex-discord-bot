@@ -60,6 +60,10 @@ Existing authentication can be reused by selecting its directory. Do not copy cr
 
 Verify that the installed Codex Linux sandbox works as this account, including any required sandbox helpers and kernel/AppArmor support. The supplied unit uses `NoNewPrivileges=true`; a sandbox setup that depends on a setuid helper needs an administrator-supported configuration compatible with that restriction. The protocol smoke test verifies policy negotiation, not execution of a sandboxed model task.
 
+### Model and reasoning effort
+
+Set `CODEX_MODEL=gpt-6-astra` and `CODEX_REASONING_EFFORT=max` in `/etc/codex-discord-bot.env` to use Astra at max effort. Supported effort levels depend on the selected model and installed Codex version. Empty values leave the corresponding Codex setting unchanged. Explicit settings apply to new and resumed conversations, including follow-ups in existing Discord task channels; the bot verifies the effective settings before submitting work. Restart the service after changing its environment, preferably after active tasks finish. No database migration is needed.
+
 ### Approval mode
 
 `CODEX_APPROVALS_REVIEWER=auto_review` selects **Approve for me** and is the default when the variable is absent, including on upgrades. Codex's [automatic reviewer](https://learn.chatgpt.com/docs/sandboxing/auto-review) evaluates eligible requests and can approve or deny them. The bot uses `on-request` approval policy with the workspace-write sandbox and restricted network access. Any request Codex sends to Discord still requires your click; the bot does not blindly accept requests.
