@@ -316,6 +316,8 @@ fn needs_attention(key: &str, interactive: bool) -> bool {
             "task-dismissed:",
             "failure:",
             "question:",
+            "integration-blocked:",
+            "integration-merged:",
         ]
         .iter()
         .any(|prefix| key.starts_with(prefix))
@@ -333,6 +335,8 @@ mod tests {
             "recovery:generation:session",
             "recovered:generation:session",
             "expired:request",
+            "integration-blocked:run",
+            "integration-merged:run",
         ] {
             assert!(needs_attention(key, false), "{key}");
         }

@@ -69,6 +69,28 @@ impl Manager {
         );
         if !dismiss {
             self.store.require_issue_validation(id).await?;
+            self.store.require_issue_integration(id).await?;
+        } else {
+            let integration: Option<crate::integration::Integration> = sqlx::query_as("SELECT i.* FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE r.session_id=$1")
+                .bind(id).fetch_optional(&self.store.pool).await?;
+            if let Some(i) = integration {
+                ensure!(
+                    i.merge_sha.is_none(),
+                    "This issue was integrated; verify its release and use /complete before advancing the queue"
+                );
+                if i.operation.is_some() || !i.retry_safe {
+                    self.reconcile_integration(&i).await?;
+                }
+                let i = self
+                    .store
+                    .integration(i.run_id)
+                    .await?
+                    .context("Missing integration")?;
+                ensure!(
+                    i.retry_safe && i.merge_sha.is_none(),
+                    "Integration is open or uncertain. Inspect GitHub and close the unmerged PR before dismissing"
+                );
+            }
         }
         if failed_setup {
             let mut tx = self.store.pool.begin().await?;
@@ -107,7 +129,7 @@ impl Manager {
         let session = self.store.session(id).await?;
         ensure!(session.guild_id == guild.to_string(), "Wrong guild");
         if self.cancel_validation(id) {
-            return Ok("Validation cancellation requested. Waiting for the worker to stop.".into());
+            return Ok("Validation or integration cancellation requested. Waiting for the current operation to settle.".into());
         }
         let gate = self.gate(id);
         let _guard = gate.lock().await;

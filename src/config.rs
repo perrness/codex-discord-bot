@@ -55,6 +55,7 @@ pub struct Config {
     pub tool_path: String,
     pub model: Option<String>,
     pub validation: crate::validation::Policies,
+    pub integration: crate::integration::Policies,
     pub approvals_reviewer: ApprovalsReviewer,
     pub rpc_timeout: Duration,
 }
@@ -146,6 +147,13 @@ impl Config {
                 }
                 Ok(_) | Err(env::VarError::NotPresent) => Default::default(),
                 Err(error) => return Err(error).context("Invalid VALIDATION_CONFIG"),
+            },
+            integration: match env::var("INTEGRATION_CONFIG") {
+                Ok(path) if !path.is_empty() => {
+                    crate::integration::Policies::load(std::path::Path::new(&path))?
+                }
+                Ok(_) | Err(env::VarError::NotPresent) => Default::default(),
+                Err(error) => return Err(error).context("Invalid INTEGRATION_CONFIG"),
             },
             approvals_reviewer: match env::var("CODEX_APPROVALS_REVIEWER") {
                 Ok(value) => value.parse()?,
@@ -274,6 +282,7 @@ mod tests {
             tool_path: "/usr/bin:/bin".into(),
             model: None,
             validation: Default::default(),
+            integration: Default::default(),
             approvals_reviewer: ApprovalsReviewer::default(),
             rpc_timeout: Duration::from_secs(1),
         };

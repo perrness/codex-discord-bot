@@ -102,7 +102,7 @@ impl Store {
             _ => Decision::Blocked,
         };
         let reason = match decision {
-            Decision::Passed => "Trusted build, test and lint checks passed. Awaiting integration and explicit /complete.".to_owned(),
+            Decision::Passed => "Trusted build, test and lint checks passed. Preparing a fresh integration candidate.".to_owned(),
             Decision::Repair => format!("Trusted validation failed. Starting repair {} of {} in this issue's conversation.", repairs + 1, policy.as_ref().context("Missing repair policy")?.max_repairs),
             Decision::Blocked => error.map(str::to_owned).unwrap_or_else(||
                 "Validation blocked: checks failed, were incomplete/cancelled, or the repair limit was exhausted. Inspect the recorded results; dismiss and explicitly retry the issue after review.".into()),
@@ -146,8 +146,9 @@ impl Store {
                 .bind(run.id).bind(run.claim_id).bind(next.as_str())
                 .bind(if decision == Decision::Passed { None } else { Some(reason.as_str()) }).execute(&mut *tx).await?.rows_affected();
             ensure!(changed == 1, "Missing successful validation evidence");
-            sqlx::query("UPDATE sessions SET status='idle',repository_claimed=false,last_error=$2,updated_at=now() WHERE id=$1 AND status='validating' AND current_turn_id IS NULL")
-                .bind(session).bind(if decision == Decision::Passed { None } else { Some(reason.as_str()) }).execute(&mut *tx).await?;
+            sqlx::query("UPDATE sessions SET status=$3,repository_claimed=$4,last_error=$2,updated_at=now() WHERE id=$1 AND status='validating' AND current_turn_id IS NULL")
+                .bind(session).bind(if decision == Decision::Passed { None } else { Some(reason.as_str()) })
+                .bind(if decision == Decision::Passed { "integrating" } else { "idle" }).bind(decision == Decision::Passed).execute(&mut *tx).await?;
             None
         };
         sqlx::query("UPDATE sessions SET status_snapshot=jsonb_set(status_snapshot,'{activity}',to_jsonb($2::text)),updated_at=now() WHERE id=$1")

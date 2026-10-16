@@ -1,0 +1,10 @@
+{
+  "repositories": {
+    "codex-discord-bot": {
+      "github_repository": "perrness/codex-discord-bot",
+      "release_gate": "deployments_disabled",
+      "protected_paths": ["deploy", "scripts"],
+      "checks_timeout_seconds": 900
+    }
+  }
+}

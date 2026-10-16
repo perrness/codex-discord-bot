@@ -1,3 +1,4 @@
+mod integration;
 mod interactive;
 mod queue;
 mod recovery;
@@ -381,6 +382,12 @@ impl Manager {
     }
 
     async fn followup_locked(&self, session: &Session, source: &str, text: &str) -> Result<()> {
+        let integrated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE r.session_id=$1)")
+            .bind(session.id).fetch_one(&self.store.pool).await?;
+        ensure!(
+            !integrated,
+            "This issue's integration candidate is immutable. Inspect /queue status; dismiss a safely blocked attempt and use /queue retry for changes"
+        );
         if session.terminal_task() {
             // An authorized follow-up cancels retention or restores a dismissed legacy thread
             // to the list even if another repository owner or unavailable history blocks resuming.
@@ -525,7 +532,7 @@ impl Manager {
             .context("Use /stop inside a task channel, or supply a session ID")?;
         ensure!(session.guild_id == guild.to_string(), "Wrong guild");
         if self.cancel_validation(session.id) {
-            return Ok("Validation cancellation requested. Waiting for the worker to stop.".into());
+            return Ok("Validation or integration cancellation requested. Waiting for the current operation to settle.".into());
         }
         ensure!(
             !session.repository_claimed,
@@ -675,6 +682,15 @@ impl Manager {
                     .retain(|(thread, _), _| thread != &e.thread_id);
                 if let Some(run) = validation {
                     self.validate_issue_turn(&session, &e.turn.id, &run).await?;
+                    let integrating: bool = sqlx::query_scalar(
+                        "SELECT state='integrating' FROM issue_runs WHERE id=$1",
+                    )
+                    .bind(run.id)
+                    .fetch_one(&self.store.pool)
+                    .await?;
+                    if integrating {
+                        self.integrate_issue(&session, &run).await?;
+                    }
                 }
                 if !self.store.session(session.id).await?.repository_claimed {
                     self.drop_repository_lock(&session);

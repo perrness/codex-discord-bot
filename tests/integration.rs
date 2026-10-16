@@ -223,6 +223,7 @@ impl Fixture {
             tool_path: "/usr/bin:/bin".into(),
             model: None,
             validation: Default::default(),
+            integration: Default::default(),
             approvals_reviewer: Default::default(),
             rpc_timeout: Duration::from_secs(1),
         });
@@ -2231,7 +2232,7 @@ async fn completed_issue_turn_without_trusted_checks_blocks_completion() -> Resu
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
-async fn validation_evidence_guards_integration_and_new_turns_invalidate_it() -> Result<()> {
+async fn validation_evidence_guards_integration_and_retains_the_repository_claim() -> Result<()> {
     use codex_discord_bot::queue::State;
     let api = discord::Api::start().await;
     let f = Fixture::with_http(api.http.clone()).await?;
@@ -2269,24 +2270,39 @@ async fn validation_evidence_guards_integration_and_new_turns_invalidate_it() ->
             .await
             .is_err()
     );
-    assert!(!store.session(session.id).await?.repository_claimed);
-    f.manager.finish_task(42, 7, session.id, false).await?;
-    // Reopening and starting another turn atomically invalidates the old success.
-    f.manager
-        .followup(
-            42,
-            7,
-            session.channel_id().unwrap().parse()?,
-            "modify-after-validation",
-            "Change the implementation",
-        )
-        .await?;
-    assert!(store.require_issue_validation(session.id).await.is_err());
+    assert!(store.session(session.id).await?.repository_claimed);
+    assert!(
+        f.manager
+            .finish_task(42, 7, session.id, false)
+            .await
+            .is_err()
+    );
+    assert!(store.require_issue_integration(session.id).await.is_err());
+    assert!(
+        store
+            .transition_issue(&run, State::Integrating, State::Releasing, None)
+            .await
+            .is_err()
+    );
+    // A validated turn remains reserved until candidate integration finishes.
+    assert!(
+        f.manager
+            .followup(
+                42,
+                7,
+                session.channel_id().unwrap().parse()?,
+                "modify-after-validation",
+                "Change the implementation",
+            )
+            .await
+            .is_err()
+    );
+    store.require_issue_validation(session.id).await?;
     let state: String = sqlx::query_scalar("SELECT state FROM issue_runs WHERE id=$1")
         .bind(run.id)
         .fetch_one(&store.pool)
         .await?;
-    assert_eq!(state, "implementing");
+    assert_eq!(state, "integrating");
     assert_eq!(f.mock.count("thread/start"), 1);
     assert_eq!(
         store.session(session.id).await?.codex_thread_id,
@@ -2424,5 +2440,320 @@ async fn restart_does_not_submit_a_durably_reserved_repair() -> Result<()> {
     assert_eq!(run_state, ("blocked".into(), 1));
     assert_eq!(f.mock.count("turn/start"), 1);
     assert!(store.require_issue_validation(session.id).await.is_err());
+    f.cleanup().await
+}
+
+fn integration_policy() -> codex_discord_bot::integration::Policy {
+    serde_json::from_value(json!({"github_repository":"owner/repo","release_gate":"deployments_disabled","protected_paths":["deploy"],"checks_timeout_seconds":10})).unwrap()
+}
+
+async fn ready_for_integration(
+    f: &Fixture,
+    name: &str,
+) -> Result<(codex_discord_bot::queue::Run, Session)> {
+    let (run, session) = f.issue_task(name).await?;
+    let store = &f.manager.store;
+    validating(store, &run).await?;
+    let (id, _) = store
+        .begin_issue_validation(&run, "turn-new", Some(&validation_policy(0)))
+        .await?;
+    store.record_issue_checks(id, &validation_results()).await?;
+    store.finish_issue_validation(&run, id, None).await?;
+    Ok((run, session))
+}
+
+async fn validated_candidate(store: &Store, run: Uuid) -> Result<()> {
+    store
+        .integration_source(run, "main", &"a".repeat(40), &"b".repeat(40))
+        .await?;
+    store
+        .integration_candidate(run, &"c".repeat(40), &"d".repeat(40))
+        .await?;
+    store.integration_checks(run, &validation_results()).await?;
+    store.validate_integration(run).await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn integration_reservations_serialize_and_reject_partial_or_stale_evidence() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = ready_for_integration(&f, "integration-claims").await?;
+    let store = &f.manager.store;
+    let policy = integration_policy();
+    let path = f.directory.path().join("integration");
+    let (a, b) = tokio::join!(
+        store.begin_issue_integration(&run, &policy, path.to_str().unwrap()),
+        store.begin_issue_integration(&run, &policy, path.to_str().unwrap())
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert!(store.session(session.id).await?.repository_claimed);
+    assert!(store.claim_issue(run.repository_id).await?.is_none());
+    assert!(
+        store
+            .integration_step(run.id, "validated", "pushing")
+            .await
+            .is_err()
+    );
+    store
+        .integration_source(run.id, "main", &"a".repeat(40), &"b".repeat(40))
+        .await?;
+    store
+        .integration_candidate(run.id, &"c".repeat(40), &"d".repeat(40))
+        .await?;
+    store
+        .integration_checks(run.id, &validation_results()[..2])
+        .await?;
+    assert!(store.validate_integration(run.id).await.is_err());
+    store
+        .integration_checks(run.id, &validation_results())
+        .await?;
+    store.validate_integration(run.id).await?;
+    assert!(
+        store
+            .integration_candidate(run.id, &"f".repeat(40), &"d".repeat(40))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .integration_checks(run.id, &validation_results())
+            .await
+            .is_err()
+    );
+    assert!(store.require_issue_integration(session.id).await.is_err());
+    assert!(
+        store
+            .finish_integration(run.id, &"e".repeat(40))
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE issue_runs SET validation_id=NULL WHERE id=$1")
+        .bind(run.id)
+        .execute(&store.pool)
+        .await?;
+    assert!(
+        store
+            .integration_step(run.id, "validated", "pushing")
+            .await
+            .is_err()
+    );
+    assert_eq!(store.integration(run.id).await?.unwrap().state, "validated");
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn integration_intents_cannot_replay_and_confirmed_merge_survives_restart_until_release()
+-> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = ready_for_integration(&f, "integration-success").await?;
+    let store = &f.manager.store;
+    store
+        .begin_issue_integration(
+            &run,
+            &integration_policy(),
+            f.directory.path().join("candidate").to_str().unwrap(),
+        )
+        .await?;
+    validated_candidate(store, run.id).await?;
+    for (from, to) in [
+        ("validated", "pushing"),
+        ("pushing", "pushed"),
+        ("pushed", "creating_pr"),
+        ("creating_pr", "checking"),
+        ("checking", "merging"),
+    ] {
+        store.integration_step(run.id, from, to).await?;
+        assert!(store.integration_step(run.id, from, to).await.is_err());
+    }
+    store
+        .integration_pr(run.id, 7, "https://github.com/owner/repo/pull/7")
+        .await?;
+    assert!(
+        store
+            .integration_pr(run.id, 8, "https://github.com/owner/repo/pull/8")
+            .await
+            .is_err()
+    );
+    let request = Uuid::new_v4();
+    store
+        .integration_merge_request(
+            run.id,
+            &json!({"status":"pending","details":{"uuid":request}}),
+        )
+        .await?;
+    assert_eq!(
+        store.integration(run.id).await?.unwrap().merge_request_id,
+        Some(request)
+    );
+    // Recovery may see no active Codex turn; durable successful checks restore the
+    // completed outcome when the integration's merge is independently verified.
+    sqlx::query("UPDATE sessions SET status='idle',last_outcome='unknown',repository_claimed=false WHERE id=$1")
+        .bind(session.id).execute(&store.pool).await?;
+    store.finish_integration(run.id, &"e".repeat(40)).await?;
+    store.finish_integration(run.id, &"e".repeat(40)).await?;
+    assert!(
+        store
+            .finish_integration(run.id, &"f".repeat(40))
+            .await
+            .is_err()
+    );
+    store.reconcile_issues().await?;
+    store.require_issue_integration(session.id).await?;
+    assert_eq!(
+        store.integration(run.id).await?.unwrap().merge_sha,
+        Some("e".repeat(40))
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM issue_runs WHERE id=$1")
+        .bind(run.id)
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(state, "releasing");
+    assert!(!store.session(session.id).await?.repository_claimed);
+    assert!(store.claim_issue(run.repository_id).await?.is_none());
+    assert!(store.retry_issue(run.repository_id, 5).await.is_err());
+    assert!(
+        f.manager
+            .finish_task(42, 7, session.id, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.manager
+            .followup(
+                42,
+                7,
+                session.channel_id().unwrap().parse()?,
+                "edit-integrated",
+                "Change the code"
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(f.mock.count("turn/start"), 1);
+    // Explicit /complete is the existing operator confirmation of release.
+    f.manager.finish_task(42, 7, session.id, false).await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM issue_runs WHERE id=$1")
+        .bind(run.id)
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(state, "released");
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn interrupted_integration_keeps_evidence_and_explicit_retry_allocates_a_new_attempt()
+-> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = ready_for_integration(&f, "integration-restart").await?;
+    let store = &f.manager.store;
+    let i = store
+        .begin_issue_integration(
+            &run,
+            &integration_policy(),
+            f.directory.path().join("candidate").to_str().unwrap(),
+        )
+        .await?;
+    store
+        .integration_source(run.id, "main", &"a".repeat(40), &"b".repeat(40))
+        .await?;
+    store
+        .integration_candidate(run.id, &"c".repeat(40), &"d".repeat(40))
+        .await?;
+    store
+        .integration_checks(run.id, &validation_results()[..1])
+        .await?;
+    f.manager.reconcile_integrations().await?;
+    store.reconcile_issues().await?;
+    let blocked = store.integration(run.id).await?.unwrap();
+    assert_eq!(blocked.state, "blocked");
+    assert!(blocked.retry_safe && blocked.validated_at.is_none());
+    assert_eq!(blocked.results.as_array().unwrap().len(), 1);
+    let validation: Option<Uuid> =
+        sqlx::query_scalar("SELECT validation_id FROM issue_runs WHERE id=$1")
+            .bind(run.id)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(validation, Some(i.validation_id));
+    assert_eq!(f.mock.count("turn/start"), 1);
+    assert!(store.validate_integration(run.id).await.is_err());
+    assert!(
+        store
+            .begin_issue_integration(&run, &integration_policy(), &i.worktree)
+            .await
+            .is_err()
+    );
+    f.manager.finish_task(42, 7, session.id, true).await?;
+    store.retry_issue(run.repository_id, 5).await?;
+    let next = store.claim_issue(run.repository_id).await?.unwrap();
+    assert_ne!(next.id, run.id);
+    assert_eq!(next.attempt, 2);
+    assert_eq!(
+        store.integration(run.id).await?.unwrap().candidate_sha,
+        Some("c".repeat(40))
+    );
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn unknown_remote_mutation_prevents_retry_even_after_session_dismissal() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = ready_for_integration(&f, "integration-unknown").await?;
+    let store = &f.manager.store;
+    store
+        .begin_issue_integration(
+            &run,
+            &integration_policy(),
+            f.directory.path().join("candidate").to_str().unwrap(),
+        )
+        .await?;
+    validated_candidate(store, run.id).await?;
+    store
+        .integration_step(run.id, "validated", "pushing")
+        .await?;
+    store.integration_step(run.id, "pushing", "pushed").await?;
+    store
+        .integration_step(run.id, "pushed", "creating_pr")
+        .await?;
+    store
+        .block_integration(run.id, "PR outcome uncertain", true, false)
+        .await?;
+    // A stale channel state cannot circumvent the durable remote-operation guard.
+    sqlx::query("UPDATE sessions SET channel_state='dismissed' WHERE id=$1")
+        .bind(session.id)
+        .execute(&store.pool)
+        .await?;
+    assert!(store.retry_issue(run.repository_id, 5).await.is_err());
+    assert!(
+        store
+            .integration_step(run.id, "pushed", "creating_pr")
+            .await
+            .is_err()
+    );
+    assert!(store.claim_issue(run.repository_id).await?.is_none());
+    assert_eq!(
+        store
+            .integration(run.id)
+            .await?
+            .unwrap()
+            .operation
+            .as_deref(),
+        Some("create_pr")
+    );
+    // Even a legacy cancellation must not free an uncertain remote-operation slot.
+    store
+        .enqueue_issue(run.repository_id, "owner/repo", 6)
+        .await?;
+    sqlx::query("UPDATE issue_runs SET state='cancelled' WHERE id=$1")
+        .bind(run.id)
+        .execute(&store.pool)
+        .await?;
+    assert!(store.claim_issue(run.repository_id).await?.is_none());
     f.cleanup().await
 }

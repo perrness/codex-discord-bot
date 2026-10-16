@@ -208,7 +208,7 @@ impl Policy {
 
 /// Root ownership and all ancestor modes prevent the service account (and Codex)
 /// from replacing policy or tools. No rootfs sockets/devices are allowed.
-fn trusted_path(path: &Path) -> Result<()> {
+pub(crate) fn trusted_path(path: &Path) -> Result<()> {
     ensure!(
         path.is_absolute() && path.canonicalize()? == path,
         "Trusted path must be canonical"

@@ -1,5 +1,6 @@
 //! Durable dispatch. Claims are never recycled on a timer: an expired external
 //! operation may still have executed. Restart requires explicit operator review.
+mod integration;
 mod validation;
 use crate::persistence::Store;
 use anyhow::{Result, ensure};
@@ -78,7 +79,7 @@ impl Store {
         if enabled != Some(true) {
             return Ok(None);
         }
-        let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_runs WHERE repository_id=$1 AND state IN ('preparing','implementing','validating','integrating','releasing','blocked')) OR EXISTS(SELECT 1 FROM sessions WHERE repository_id=$1 AND repository_claimed)")
+        let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_runs WHERE repository_id=$1 AND state IN ('preparing','implementing','validating','integrating','releasing','blocked')) OR EXISTS(SELECT 1 FROM sessions WHERE repository_id=$1 AND repository_claimed) OR EXISTS(SELECT 1 FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE i.repository_id=$1 AND ((i.state <> 'merged' AND NOT i.retry_safe) OR (i.merge_sha IS NOT NULL AND r.state <> 'released')))")
             .bind(repo).fetch_one(&mut *tx).await?;
         if busy {
             return Ok(None);
@@ -96,7 +97,7 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         ensure!(from.permits(to), "Invalid issue state transition");
-        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs))")
+        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs)) AND ($4 NOT IN ('releasing','released') OR id IN (SELECT id FROM integrated_issue_runs))")
             .bind(run.id).bind(run.claim_id).bind(from.as_str()).bind(to.as_str()).bind(error).execute(&self.pool).await?.rows_affected();
         ensure!(changed == 1, "Stale issue claim or state");
         Ok(())
@@ -105,7 +106,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE issue_validations SET state='interrupted',error='Service restarted during validation; checks were not replayed',finished_at=now() WHERE state='running'")
             .execute(&mut *tx).await?;
-        sqlx::query("UPDATE issue_runs SET state='blocked',validation_id=NULL,last_error='Service restarted; inspect the linked session before retry. No turn was replayed.',updated_at=now() WHERE state IN ('preparing','implementing','validating','integrating','releasing')")
+        sqlx::query("UPDATE issue_runs SET state='blocked',validation_id=CASE WHEN EXISTS(SELECT 1 FROM issue_integrations i WHERE i.run_id=issue_runs.id) THEN validation_id ELSE NULL END,last_error='Service restarted; inspect the linked session before retry. No turn was replayed.',updated_at=now() WHERE state IN ('preparing','implementing','validating','integrating','releasing') AND id NOT IN (SELECT id FROM integrated_issue_runs)")
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -128,6 +129,12 @@ impl Store {
             .await?;
         let old: Run = sqlx::query_as("SELECT * FROM issue_runs WHERE repository_id=$1 AND issue_number=$2 ORDER BY attempt DESC LIMIT 1 FOR UPDATE")
             .bind(repo).bind(number).fetch_one(&mut *tx).await?;
+        let unsafe_integration: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_integrations WHERE run_id=$1 AND (state <> 'blocked' OR NOT retry_safe OR merge_sha IS NOT NULL))")
+            .bind(old.id).fetch_one(&mut *tx).await?;
+        ensure!(
+            !unsafe_integration,
+            "Integration is merged, open or uncertain. Reconcile GitHub first; close any unmerged PR before retrying"
+        );
         ensure!(
             matches!(old.state.as_str(), "blocked" | "failed" | "cancelled"),
             "Only blocked, failed or cancelled issues can be retried"
