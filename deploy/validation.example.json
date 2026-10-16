@@ -1,0 +1,20 @@
+{
+  "repositories": {
+    "codex-discord-bot": {
+      "rootfs": "/opt/codex-validation/rust-rootfs",
+      "max_repairs": 2,
+      "build": {
+        "argv": ["/usr/local/bin/cargo", "build", "--release", "--locked", "--offline"],
+        "timeout_seconds": 900
+      },
+      "test": {
+        "argv": ["/usr/local/bin/cargo", "test", "--locked", "--offline"],
+        "timeout_seconds": 600
+      },
+      "lint": {
+        "argv": ["/usr/local/bin/cargo", "clippy", "--all-targets", "--locked", "--offline", "--", "-D", "warnings"],
+        "timeout_seconds": 600
+      }
+    }
+  }
+}

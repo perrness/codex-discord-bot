@@ -1,5 +1,6 @@
 //! Durable dispatch. Claims are never recycled on a timer: an expired external
 //! operation may still have executed. Restart requires explicit operator review.
+mod validation;
 use crate::persistence::Store;
 use anyhow::{Result, ensure};
 use uuid::Uuid;
@@ -95,14 +96,28 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         ensure!(from.permits(to), "Invalid issue state transition");
-        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3")
+        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs))")
             .bind(run.id).bind(run.claim_id).bind(from.as_str()).bind(to.as_str()).bind(error).execute(&self.pool).await?.rows_affected();
         ensure!(changed == 1, "Stale issue claim or state");
         Ok(())
     }
     pub async fn reconcile_issues(&self) -> Result<()> {
-        sqlx::query("UPDATE issue_runs SET state='blocked',last_error='Service restarted; inspect the linked session before retry. No turn was replayed.',updated_at=now() WHERE state IN ('preparing','implementing','validating','integrating','releasing')")
-            .execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE issue_validations SET state='interrupted',error='Service restarted during validation; checks were not replayed',finished_at=now() WHERE state='running'")
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE issue_runs SET state='blocked',validation_id=NULL,last_error='Service restarted; inspect the linked session before retry. No turn was replayed.',updated_at=now() WHERE state IN ('preparing','implementing','validating','integrating','releasing')")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn require_issue_validation(&self, session: Uuid) -> Result<()> {
+        let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1 AND (state NOT IN ('integrating','releasing') OR id NOT IN (SELECT id FROM validated_issue_runs)))")
+            .bind(session).fetch_one(&self.pool).await?;
+        ensure!(
+            !blocked,
+            "Trusted issue validation has not passed. Inspect /queue status; blocked attempts require dismissal and explicit /queue retry."
+        );
         Ok(())
     }
     pub async fn retry_issue(&self, repo: Uuid, number: i64) -> Result<()> {

@@ -2,6 +2,7 @@ mod interactive;
 mod queue;
 mod recovery;
 mod tasks;
+mod validation;
 
 use crate::{
     codex::{Client, RpcError, protocol::*},
@@ -46,6 +47,7 @@ pub struct Manager {
     // Also allows /stop during database outages.
     live: Mutex<HashMap<u64, (String, String)>>,
     previews: Mutex<HashMap<(String, String), Value>>,
+    validations: Mutex<HashMap<Uuid, CancellationToken>>,
 }
 
 impl Manager {
@@ -77,6 +79,7 @@ impl Manager {
             repository_locks: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             previews: Mutex::new(HashMap::new()),
+            validations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -279,6 +282,10 @@ impl Manager {
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE sessions SET status='running',repository_claimed=true,current_turn_id=NULL,last_error=NULL,status_snapshot='{}',updated_at=now() WHERE id=$1")
+            .bind(session.id).execute(&mut *tx).await?;
+        // Invalidate evidence before any new turn can change the worktree. Persist
+        // implementing before submission so a fast completion cannot race dispatch.
+        sqlx::query("UPDATE issue_runs SET validation_id=NULL,state=CASE WHEN state IN ('preparing','integrating','releasing','released') THEN 'implementing' ELSE state END,updated_at=now() WHERE session_id=$1")
             .bind(session.id).execute(&mut *tx).await?;
         tx.commit().await?;
         let turn = match self
@@ -517,6 +524,9 @@ impl Manager {
             .await?
             .context("Use /stop inside a task channel, or supply a session ID")?;
         ensure!(session.guild_id == guild.to_string(), "Wrong guild");
+        if self.cancel_validation(session.id) {
+            return Ok("Validation cancellation requested. Waiting for the worker to stop.".into());
+        }
         ensure!(
             !session.repository_claimed,
             "Session is starting or recovering; wait for its status update"
@@ -630,8 +640,17 @@ impl Manager {
                 self.client.clean_terminals(&e.thread_id).await?;
                 self.deliver_response(&session, &e.turn.id).await?;
                 let mut tx = self.store.pool.begin().await?;
-                sqlx::query("UPDATE sessions SET status='idle',repository_claimed=false,current_turn_id=NULL,last_outcome=$2,last_error=$3,updated_at=now() WHERE id=$1")
-                    .bind(session.id).bind(outcome).bind(if outcome == "failed" { Some("Codex turn failed; check the task output and service logs") } else { None }).execute(&mut *tx).await?;
+                let validation: Option<crate::queue::Run> = if outcome == "completed" {
+                    sqlx::query_as("UPDATE issue_runs SET state='validating',updated_at=now() WHERE session_id=$1 AND state='implementing' RETURNING *")
+                        .bind(session.id).fetch_optional(&mut *tx).await?
+                } else {
+                    sqlx::query("UPDATE issue_runs SET state='blocked',validation_id=NULL,last_error=$2,updated_at=now() WHERE session_id=$1 AND state IN ('preparing','implementing')")
+                        .bind(session.id).bind(format!("Codex turn {outcome}; explicit review and retry required")).execute(&mut *tx).await?;
+                    None
+                };
+                sqlx::query("UPDATE sessions SET status=$4,repository_claimed=$5,current_turn_id=NULL,last_outcome=$2,last_error=$3,updated_at=now() WHERE id=$1")
+                    .bind(session.id).bind(outcome).bind(if outcome == "failed" { Some("Codex turn failed; check the task output and service logs") } else { None })
+                    .bind(if validation.is_some() { "validating" } else { "idle" }).bind(validation.is_some()).execute(&mut *tx).await?;
                 sqlx::query("UPDATE pending_requests SET state='expired',updated_at=now() WHERE session_id=$1 AND state IN ('pending','responding')")
                     .bind(session.id).execute(&mut *tx).await?;
                 if outcome != "completed" {
@@ -647,7 +666,6 @@ impl Manager {
                     .await?;
                 }
                 tx.commit().await?;
-                self.drop_repository_lock(&session);
                 if let Some(channel) = session.channel_id().and_then(|v| v.parse().ok()) {
                     self.live.lock().unwrap().remove(&channel);
                 }
@@ -655,6 +673,12 @@ impl Manager {
                     .lock()
                     .unwrap()
                     .retain(|(thread, _), _| thread != &e.thread_id);
+                if let Some(run) = validation {
+                    self.validate_issue_turn(&session, &e.turn.id, &run).await?;
+                }
+                if !self.store.session(session.id).await?.repository_claimed {
+                    self.drop_repository_lock(&session);
+                }
             }
             "serverRequest/resolved" => {
                 let e: ResolvedEvent = serde_json::from_value(params)?;

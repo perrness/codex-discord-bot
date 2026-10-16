@@ -6,3 +6,4 @@ pub mod persistence;
 pub mod queue;
 pub mod repositories;
 pub mod sessions;
+pub mod validation;

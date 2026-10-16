@@ -67,9 +67,16 @@ impl Manager {
             dismiss || session.last_outcome.as_deref() == Some("completed"),
             "The last turn did not succeed; continue the task or explicitly /dismiss it"
         );
+        if !dismiss {
+            self.store.require_issue_validation(id).await?;
+        }
         if failed_setup {
+            let mut tx = self.store.pool.begin().await?;
             sqlx::query("UPDATE sessions SET channel_state='dismissed',completed_at=now(),delete_after=NULL,updated_at=now() WHERE id=$1")
-                .bind(id).execute(&self.store.pool).await?;
+                .bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE issue_runs SET state='cancelled',validation_id=NULL,updated_at=now() WHERE session_id=$1")
+                .bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
             return Ok("Failed setup dismissed. No Codex work was submitted; use /codex to start a new task.".into());
         }
         if legacy {
@@ -83,6 +90,8 @@ impl Manager {
         }
         let state = if dismiss { "dismissed" } else { "completed" };
         let mut tx = self.store.pool.begin().await?;
+        sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,updated_at=now() WHERE session_id=$1")
+            .bind(id).bind(if dismiss { "cancelled" } else { "released" }).execute(&mut *tx).await?;
         sqlx::query("UPDATE sessions SET channel_state=$2,completed_at=now(),delete_after=now()+make_interval(secs => $3::double precision),updated_at=now() WHERE id=$1")
             .bind(id).bind(state).bind(self.config.channel_retention.as_secs_f64()).execute(&mut *tx).await?;
         persistence::enqueue(&mut tx, id, &format!("task-{state}:{id}:{}", session.status_revision),
@@ -95,6 +104,11 @@ impl Manager {
 
     pub async fn stop_session(&self, user: u64, guild: u64, id: Uuid) -> Result<String> {
         self.authorize(user, Some(guild))?;
+        let session = self.store.session(id).await?;
+        ensure!(session.guild_id == guild.to_string(), "Wrong guild");
+        if self.cancel_validation(id) {
+            return Ok("Validation cancellation requested. Waiting for the worker to stop.".into());
+        }
         let gate = self.gate(id);
         let _guard = gate.lock().await;
         let s = self.store.session(id).await?;

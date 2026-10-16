@@ -54,6 +54,7 @@ pub struct Config {
     pub codex_home: PathBuf,
     pub tool_path: String,
     pub model: Option<String>,
+    pub validation: crate::validation::Policies,
     pub approvals_reviewer: ApprovalsReviewer,
     pub rpc_timeout: Duration,
 }
@@ -139,6 +140,13 @@ impl Config {
             codex_home: path("CODEX_HOME", None)?,
             tool_path: required("TOOL_PATH")?,
             model: env::var("CODEX_MODEL").ok().filter(|v| !v.is_empty()),
+            validation: match env::var("VALIDATION_CONFIG") {
+                Ok(path) if !path.is_empty() => {
+                    crate::validation::Policies::load(std::path::Path::new(&path))?
+                }
+                Ok(_) | Err(env::VarError::NotPresent) => Default::default(),
+                Err(error) => return Err(error).context("Invalid VALIDATION_CONFIG"),
+            },
             approvals_reviewer: match env::var("CODEX_APPROVALS_REVIEWER") {
                 Ok(value) => value.parse()?,
                 Err(env::VarError::NotPresent) => ApprovalsReviewer::default(),
@@ -265,6 +273,7 @@ mod tests {
             codex_bin: "/unused".into(),
             tool_path: "/usr/bin:/bin".into(),
             model: None,
+            validation: Default::default(),
             approvals_reviewer: ApprovalsReviewer::default(),
             rpc_timeout: Duration::from_secs(1),
         };

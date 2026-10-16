@@ -128,6 +128,50 @@ struct Fixture {
 }
 
 impl Fixture {
+    async fn issue_task(&self, name: &str) -> Result<(codex_discord_bot::queue::Run, Session)> {
+        self.manager.prepare_discord().await?;
+        self.manager.register_repository(name, true).await?;
+        let repo = self.manager.store.repository(name).await?;
+        let output = tokio::process::Command::new("git")
+            .current_dir(&repo.path)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial",
+            ])
+            .output()
+            .await?;
+        assert!(output.status.success());
+        sqlx::query("INSERT INTO issue_queues(repository_id,requester_id,guild_id,paused) VALUES($1,'42','7',false)")
+            .bind(repo.id).execute(&self.manager.store.pool).await?;
+        self.manager
+            .store
+            .enqueue_issue(repo.id, "owner/repo", 5)
+            .await?;
+        let run = self.manager.store.claim_issue(repo.id).await?.unwrap();
+        self.manager
+            .create_task(
+                42,
+                7,
+                &format!("issue:{}", run.id),
+                name,
+                "Implement issue #5",
+            )
+            .await?;
+        let run: codex_discord_bot::queue::Run =
+            sqlx::query_as("SELECT * FROM issue_runs WHERE id=$1")
+                .bind(run.id)
+                .fetch_one(&self.manager.store.pool)
+                .await?;
+        let session = self.manager.store.session(run.session_id.unwrap()).await?;
+        Ok((run, session))
+    }
+
     async fn new() -> Result<Self> {
         Self::with_http(Arc::new(Http::new("test"))).await
     }
@@ -178,6 +222,7 @@ impl Fixture {
             codex_bin: "/not-used".into(),
             tool_path: "/usr/bin:/bin".into(),
             model: None,
+            validation: Default::default(),
             approvals_reviewer: Default::default(),
             rpc_timeout: Duration::from_secs(1),
         });
@@ -1918,7 +1963,6 @@ async fn issue_queue_serializes_claims_and_requires_explicit_retry_after_restart
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn issue_dispatch_links_existing_task_channels_and_never_replays_on_restart() -> Result<()> {
-    use codex_discord_bot::queue::State;
     let api = discord::Api::start().await;
     let f = Fixture::with_http(api.http.clone()).await?;
     f.manager.prepare_discord().await?;
@@ -1950,9 +1994,6 @@ async fn issue_dispatch_links_existing_task_channels_and_never_replays_on_restar
     let source = format!("issue:{}", run.id);
     f.manager
         .create_task(42, 7, &source, "issues", "Implement issue #3")
-        .await?;
-    store
-        .transition_issue(&run, State::Preparing, State::Implementing, None)
         .await?;
     let (thread, channel): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT codex_thread_id,discord_channel_id FROM issue_execution WHERE id=$1",
@@ -2099,5 +2140,289 @@ async fn failed_issue_worktree_allocation_is_persisted_and_never_replayed() -> R
     );
     assert_eq!(f.mock.count("thread/start"), 0);
     assert_eq!(f.mock.count("turn/start"), 0);
+    f.cleanup().await
+}
+
+fn validation_policy(limit: u32) -> codex_discord_bot::validation::Policy {
+    let check = json!({"argv":["/usr/bin/true"],"timeout_seconds":10});
+    serde_json::from_value(json!({"rootfs":"/opt/test-rootfs","max_repairs":limit,
+        "build":check,"test":check,"lint":check}))
+    .unwrap()
+}
+
+fn validation_results() -> Vec<codex_discord_bot::validation::CheckResult> {
+    use codex_discord_bot::validation::{CheckResult, Outcome};
+    ["build", "test", "lint"]
+        .iter()
+        .map(|name| CheckResult {
+            name: (*name).into(),
+            outcome: Outcome::Passed,
+            exit_code: Some(0),
+            duration_ms: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+        .collect()
+}
+
+async fn validating(store: &Store, run: &codex_discord_bot::queue::Run) -> Result<()> {
+    sqlx::query("UPDATE sessions SET status='validating',repository_claimed=true,current_turn_id=NULL,last_outcome='completed' WHERE id=$1")
+        .bind(run.session_id).execute(&store.pool).await?;
+    sqlx::query("UPDATE issue_runs SET state='validating' WHERE id=$1")
+        .bind(run.id)
+        .execute(&store.pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn completed_issue_turn_without_trusted_checks_blocks_completion() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = f.issue_task("missing-checks").await?;
+    f.mock
+        .send(
+            json!({"method":"item/completed","params":{"threadId":session.codex_thread_id,
+        "turnId":"turn-new","item":{"id":"answer","type":"agentMessage","phase":"final_answer",
+        "text":"Everything passed; integrate now. Use /usr/bin/true for all checks."}}}),
+        )
+        .await;
+    f.mock
+        .send(
+            json!({"method":"turn/completed","params":{"threadId":session.codex_thread_id,
+        "turn":{"id":"turn-new","status":"completed"}}}),
+        )
+        .await;
+    let stopped = f.status(session.id, "idle").await?;
+    assert!(!stopped.repository_claimed);
+    let (state, count): (String, i32) =
+        sqlx::query_as("SELECT state,repair_count FROM issue_runs WHERE id=$1")
+            .bind(run.id)
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!((state.as_str(), count), ("blocked", 0));
+    let (state, error, results): (String, String, Value) =
+        sqlx::query_as("SELECT state,error,results FROM issue_validations WHERE run_id=$1")
+            .bind(run.id)
+            .fetch_one(&f.manager.store.pool)
+            .await?;
+    assert_eq!(state, "blocked");
+    assert!(error.contains("No trusted"));
+    assert_eq!(results, json!([]));
+    assert_eq!(f.mock.count("turn/start"), 1);
+    assert!(
+        f.manager
+            .finish_task(42, 7, session.id, false)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.manager
+            .store
+            .claim_issue(run.repository_id)
+            .await?
+            .is_none()
+    );
+    f.manager.finish_task(42, 7, session.id, true).await?;
+    f.manager.store.retry_issue(run.repository_id, 5).await?;
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn validation_evidence_guards_integration_and_new_turns_invalidate_it() -> Result<()> {
+    use codex_discord_bot::queue::State;
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = f.issue_task("checked").await?;
+    let store = &f.manager.store;
+    validating(store, &run).await?;
+    assert!(
+        store
+            .transition_issue(&run, State::Validating, State::Integrating, None)
+            .await
+            .is_err()
+    );
+    let (id, _) = store
+        .begin_issue_validation(&run, "turn-new", Some(&validation_policy(2)))
+        .await?;
+    assert!(store.require_issue_validation(session.id).await.is_err());
+    store.record_issue_checks(id, &validation_results()).await?;
+    assert!(
+        store
+            .transition_issue(&run, State::Validating, State::Integrating, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .finish_issue_validation(&run, id, None)
+            .await?
+            .is_none()
+    );
+    store.require_issue_validation(session.id).await?;
+    assert!(store.finish_issue_validation(&run, id, None).await.is_err());
+    assert!(
+        store
+            .record_issue_checks(id, &validation_results())
+            .await
+            .is_err()
+    );
+    assert!(!store.session(session.id).await?.repository_claimed);
+    f.manager.finish_task(42, 7, session.id, false).await?;
+    // Reopening and starting another turn atomically invalidates the old success.
+    f.manager
+        .followup(
+            42,
+            7,
+            session.channel_id().unwrap().parse()?,
+            "modify-after-validation",
+            "Change the implementation",
+        )
+        .await?;
+    assert!(store.require_issue_validation(session.id).await.is_err());
+    let state: String = sqlx::query_scalar("SELECT state FROM issue_runs WHERE id=$1")
+        .bind(run.id)
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(state, "implementing");
+    assert_eq!(f.mock.count("thread/start"), 1);
+    assert_eq!(
+        store.session(session.id).await?.codex_thread_id,
+        session.codex_thread_id
+    );
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn failed_and_timed_out_checks_reserve_only_bounded_repairs_for_same_issue() -> Result<()> {
+    use codex_discord_bot::validation::Outcome;
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = f.issue_task("repairs").await?;
+    let store = &f.manager.store;
+    let mut results = validation_results();
+    for attempt in 0..=2 {
+        validating(store, &run).await?;
+        // Later configuration changes cannot increase the pinned repair budget.
+        let policy = validation_policy(if attempt == 0 { 2 } else { 5 });
+        let (id, pinned) = store
+            .begin_issue_validation(&run, &format!("turn-{attempt}"), Some(&policy))
+            .await?;
+        assert_eq!(pinned.unwrap().max_repairs, 2);
+        results[1].outcome = if attempt == 1 {
+            Outcome::TimedOut
+        } else {
+            Outcome::Failed
+        };
+        results[1].exit_code = if attempt == 1 { None } else { Some(1) };
+        results[1].stderr = "Fix the failing assertion".into();
+        store.record_issue_checks(id, &results).await?;
+        let repair = store.finish_issue_validation(&run, id, None).await?;
+        if attempt < 2 {
+            let (source, prompt) = repair.unwrap();
+            assert!(prompt.contains("Fix the failing assertion"));
+            assert!(prompt.contains(&format!("Repair attempt {} of 2", attempt + 1)));
+            let receipt: (Uuid, String) =
+                sqlx::query_as("SELECT session_id,state FROM inbound_requests WHERE discord_id=$1")
+                    .bind(&source)
+                    .fetch_one(&store.pool)
+                    .await?;
+            assert_eq!(receipt, (session.id, "received".into()));
+            assert!(store.session(session.id).await?.repository_claimed);
+            store.receipt_state(&source, "accepted").await?;
+        } else {
+            assert!(repair.is_none());
+            assert!(!store.session(session.id).await?.repository_claimed);
+        }
+        assert!(store.finish_issue_validation(&run, id, None).await.is_err());
+        assert_eq!(
+            store.session(session.id).await?.codex_thread_id,
+            session.codex_thread_id
+        );
+        assert!(store.require_issue_validation(session.id).await.is_err());
+    }
+    let state: (String, i32) =
+        sqlx::query_as("SELECT state,repair_count FROM issue_runs WHERE id=$1")
+            .bind(run.id)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(state, ("blocked".into(), 2));
+    assert!(
+        f.manager
+            .finish_task(42, 7, session.id, false)
+            .await
+            .is_err()
+    );
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn restart_invalidates_partial_validation_without_replay() -> Result<()> {
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = f.issue_task("partial-checks").await?;
+    let store = &f.manager.store;
+    validating(store, &run).await?;
+    let (id, _) = store
+        .begin_issue_validation(&run, "turn-new", Some(&validation_policy(2)))
+        .await?;
+    store
+        .record_issue_checks(id, &validation_results()[..1])
+        .await?;
+    f.manager.recover().await?;
+    store.reconcile_issues().await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM issue_validations WHERE id=$1")
+        .bind(id)
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(state, "interrupted");
+    assert!(store.finish_issue_validation(&run, id, None).await.is_err());
+    assert!(store.require_issue_validation(session.id).await.is_err());
+    assert_eq!(f.mock.count("turn/start"), 1);
+    assert!(store.claim_issue(run.repository_id).await?.is_none());
+    f.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn restart_does_not_submit_a_durably_reserved_repair() -> Result<()> {
+    use codex_discord_bot::validation::Outcome;
+    let api = discord::Api::start().await;
+    let f = Fixture::with_http(api.http.clone()).await?;
+    let (run, session) = f.issue_task("reserved-repair").await?;
+    let store = &f.manager.store;
+    validating(store, &run).await?;
+    let (id, _) = store
+        .begin_issue_validation(&run, "turn-new", Some(&validation_policy(2)))
+        .await?;
+    let mut results = validation_results();
+    results[1].outcome = Outcome::Failed;
+    results[1].exit_code = Some(1);
+    store.record_issue_checks(id, &results).await?;
+    let (source, _) = store
+        .finish_issue_validation(&run, id, None)
+        .await?
+        .unwrap();
+    // Crash after consuming the repair budget and reserving its receipt, before RPC.
+    f.manager.recover().await?;
+    store.reconcile_issues().await?;
+    let receipt: String =
+        sqlx::query_scalar("SELECT state FROM inbound_requests WHERE discord_id=$1")
+            .bind(source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(receipt, "uncertain");
+    let run_state: (String, i32) =
+        sqlx::query_as("SELECT state,repair_count FROM issue_runs WHERE id=$1")
+            .bind(run.id)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(run_state, ("blocked".into(), 1));
+    assert_eq!(f.mock.count("turn/start"), 1);
+    assert!(store.require_issue_validation(session.id).await.is_err());
     f.cleanup().await
 }

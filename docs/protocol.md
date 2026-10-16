@@ -37,6 +37,8 @@ The client sends `initialize` with `clientInfo` and `capabilities.experimentalAp
 
 The request's `clientUserMessageId` is a correlation field. This client does **not** assume it makes turn submission idempotent. A timed-out or disconnected mutation is never automatically repeated.
 
+Queued issues run operator-configured validation after a live `turn/completed` event with outcome `completed`. The repository claim stays held through validation and any bounded repairs. Failed checks may submit a new `turn/start` in the same thread and worktree using a durable `issue-repair:<run UUID>:<repair number>` receipt. The policy, check results and consumed repair budget are persisted by Rust before submission; agent messages cannot establish validation success. A failure, interruption, unknown completion, missing policy or exhausted repair budget blocks integration. Recovery never invokes this repair loop or repeats a validation/repair interrupted by restart. Successful validation permits the integration stage; queued `/complete` also requires that evidence, and a new turn invalidates it.
+
 `thread/start` can precede creation of resumable on-disk history. A crash before the first turn may leave a conversation that cannot be resumed; recovery marks it unavailable rather than inventing a replacement task.
 
 ## Events and interactions
