@@ -5,6 +5,7 @@ pub mod github;
 pub mod integration;
 pub mod persistence;
 pub mod queue;
+pub mod releases;
 pub mod repositories;
 pub mod sessions;
 pub mod validation;

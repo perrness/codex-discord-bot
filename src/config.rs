@@ -239,7 +239,7 @@ fn optional_id(name: &str) -> Result<Option<u64>> {
         .transpose()
 }
 
-fn retention(value: &str) -> Result<Duration> {
+pub(crate) fn retention(value: &str) -> Result<Duration> {
     let hours: u64 = value
         .parse()
         .context("Invalid DISCORD_TASK_RETENTION_HOURS")?;

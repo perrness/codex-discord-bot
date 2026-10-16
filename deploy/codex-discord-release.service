@@ -1,0 +1,39 @@
+[Unit]
+Description=Trusted issue release controller (separate from Codex)
+Wants=network-online.target
+After=network-online.target codex-discord-bot.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=codex-release
+Group=codex-release
+EnvironmentFile=/etc/codex-discord-release.env
+Environment=HOME=/var/lib/codex-discord-release
+Environment=PATH=/usr/bin:/bin
+WorkingDirectory=/var/lib/codex-discord-release
+StateDirectory=codex-discord-release
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/codex-discord-bot releases
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+# Adapt to REPOS_ROOT / STATE_DIR if those paths are customized.
+InaccessiblePaths=-/repos -/var/lib/codex-discord-bot -/run/docker.sock
+MemoryMax=512M
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

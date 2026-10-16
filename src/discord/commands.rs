@@ -341,35 +341,33 @@ fn string<'a>(options: &'a [ResolvedOption<'a>], name: &str) -> Result<&'a str> 
 }
 
 fn queue_options() -> Vec<CreateCommandOption> {
-    ["list", "start", "pause", "resume", "status", "retry"]
-        .into_iter()
-        .map(|action| {
-            let mut option = CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                action,
-                format!("{action} repository issue queue"),
-            )
-            .add_sub_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "repo",
-                    "Registered repository",
-                )
+    [
+        "list", "start", "pause", "resume", "status", "retry", "release",
+    ]
+    .into_iter()
+    .map(|action| {
+        let mut option = CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            action,
+            format!("{action} repository issue queue"),
+        )
+        .add_sub_option(
+            CreateCommandOption::new(CommandOptionType::String, "repo", "Registered repository")
                 .required(true)
                 .set_autocomplete(true),
+        );
+        if action == "retry" || action == "release" {
+            option = option.add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "issue",
+                    "Issue number to inspect after review",
+                )
+                .required(true)
+                .min_int_value(1),
             );
-            if action == "retry" {
-                option = option.add_sub_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::Integer,
-                        "issue",
-                        "Issue number to retry after review",
-                    )
-                    .required(true)
-                    .min_int_value(1),
-                );
-            }
-            option
-        })
-        .collect()
+        }
+        option
+    })
+    .collect()
 }

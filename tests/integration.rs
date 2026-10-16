@@ -34,6 +34,9 @@ mod issue_recovery;
 #[path = "support/issue_concurrency.rs"]
 mod issue_concurrency;
 
+#[path = "support/issue_releases.rs"]
+mod issue_releases;
+
 struct Mock {
     writer: Arc<AsyncMutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
     observed: Arc<Mutex<Vec<Value>>>,
@@ -1099,6 +1102,7 @@ async fn migration_preserves_legacy_execution_and_approval_records() -> Result<(
         include_str!("../migrations/0007_issue_integration.sql"),
         include_str!("../migrations/0008_issue_recovery.sql"),
         include_str!("../migrations/0009_issue_concurrency.sql"),
+        include_str!("../migrations/0010_issue_releases.sql"),
     ] {
         sqlx::raw_sql(migration).execute(&mut *tx).await?;
     }
@@ -2499,7 +2503,7 @@ async fn restart_does_not_submit_a_durably_reserved_repair() -> Result<()> {
 }
 
 fn integration_policy() -> codex_discord_bot::integration::Policy {
-    serde_json::from_value(json!({"github_repository":"owner/repo","release_gate":"deployments_disabled","protected_paths":["deploy"],"checks_timeout_seconds":10})).unwrap()
+    serde_json::from_value(json!({"github_repository":"owner/repo","release_gate":"dispatch_only","protected_paths":["deploy"],"checks_timeout_seconds":10})).unwrap()
 }
 
 async fn ready_for_integration(
@@ -2688,8 +2692,14 @@ async fn integration_intents_cannot_replay_and_confirmed_merge_survives_restart_
             .is_err()
     );
     assert_eq!(f.mock.count("turn/start"), 1);
-    // Explicit /complete is the existing operator confirmation of release.
-    f.manager.finish_task(42, 7, session.id, false).await?;
+    // Operator completion cannot replace independent release verification.
+    assert!(
+        f.manager
+            .finish_task(42, 7, session.id, false)
+            .await
+            .is_err()
+    );
+    issue_releases::verified_release(store, run.id).await?;
     let state: String = sqlx::query_scalar("SELECT state FROM issue_runs WHERE id=$1")
         .bind(run.id)
         .fetch_one(&store.pool)

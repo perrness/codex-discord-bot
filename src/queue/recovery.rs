@@ -14,7 +14,7 @@ impl Store {
              state=CASE WHEN id IN (SELECT id FROM integrated_issue_runs) THEN 'releasing' ELSE 'blocked' END,
              validation_id=CASE WHEN EXISTS(SELECT 1 FROM issue_integrations i WHERE i.run_id=issue_runs.id) THEN validation_id ELSE NULL END,
              last_error=CASE WHEN id IN (SELECT id FROM integrated_issue_runs)
-                THEN 'Release awaits operator verification of the recorded merge SHA and /complete. No deployment was started or repeated.'
+                THEN 'Release awaits independent workflow and revision health verification. Recovery will not repeat deployment.'
                 ELSE 'Service restarted during ' || state || '. Inspect /queue status and the preserved worktrees; dismiss a safely stopped attempt before /queue retry. No work was replayed.' END,
              updated_at=now()
              WHERE state IN ('preparing','implementing','validating','integrating','releasing')

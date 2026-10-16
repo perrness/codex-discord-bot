@@ -68,15 +68,14 @@ impl Manager {
             "The last turn did not succeed; continue the task or explicitly /dismiss it"
         );
         if !dismiss {
-            self.store.require_issue_validation(id).await?;
-            self.store.require_issue_integration(id).await?;
+            self.store.require_issue_release(id).await?;
         } else {
             let integration: Option<crate::integration::Integration> = sqlx::query_as("SELECT i.* FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE r.session_id=$1")
                 .bind(id).fetch_optional(&self.store.pool).await?;
             if let Some(i) = integration {
                 ensure!(
                     i.merge_sha.is_none(),
-                    "This issue was integrated; verify its release and use /complete before advancing the queue"
+                    "This issue was integrated; independent release verification is required before advancing the queue"
                 );
                 if i.operation.is_some() || !i.retry_safe {
                     self.reconcile_integration(&i).await?;
@@ -120,17 +119,12 @@ impl Manager {
         let is_issue = issue.is_some();
         if let Some(run) = issue {
             if !dismiss {
-                // The authorized operator confirms the exact integrated revision.
-                // Receipt, release state, cleanup intent and Discord completion
-                // commit together, including when the command response is lost.
-                let changed = sqlx::query("INSERT INTO issue_release_confirmations(run_id,github_repository,merge_sha,confirmed_by) SELECT r.id,r.github_repository,i.merge_sha,$2 FROM issue_runs r JOIN issue_integrations i ON i.run_id=r.id WHERE r.id=$1 AND r.state='releasing' AND r.id IN (SELECT id FROM integrated_issue_runs)")
-                    .bind(run.id).bind(user.to_string()).execute(&mut *tx).await?.rows_affected();
+                // /complete can close presentation again after /reconnect, but
+                // cannot manufacture deployment evidence or a release receipt.
                 ensure!(
-                    changed == 1,
-                    "Release confirmation requires a verified integration awaiting release"
+                    run.state == "released",
+                    "Release is not independently verified"
                 );
-                sqlx::query("INSERT INTO issue_worktree_cleanup(run_id,kind,path,branch,revision) SELECT r.id,'issue',r.worktree,r.branch,i.source_sha FROM issue_runs r JOIN issue_integrations i ON i.run_id=r.id WHERE r.id=$1 AND r.worktree IS NOT NULL AND r.branch IS NOT NULL AND i.source_sha IS NOT NULL UNION ALL SELECT run_id,'integration',worktree,branch,candidate_sha FROM issue_integrations WHERE run_id=$1 AND candidate_sha IS NOT NULL")
-                    .bind(run.id).execute(&mut *tx).await?;
             }
             sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,last_error=CASE WHEN $2='released' THEN NULL ELSE last_error END,updated_at=now() WHERE id=$1")
                 .bind(run.id).bind(if dismiss { "cancelled" } else { "released" }).execute(&mut *tx).await?;

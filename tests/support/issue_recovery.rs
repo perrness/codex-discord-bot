@@ -310,7 +310,7 @@ async fn release_confirmation_and_cleanup_survive_crashes_without_releasing_twic
         .bind(run.id)
         .fetch_one(&store.pool)
         .await?;
-    assert_eq!(state, "releasing");
+    assert_eq!(state, "blocked");
     assert!(candidate.exists());
     assert!(store.claim_issue(run.repository_id).await?.is_none());
     assert!(store.retry_issue(run.repository_id, 5).await.is_err());
@@ -318,7 +318,13 @@ async fn release_confirmation_and_cleanup_survive_crashes_without_releasing_twic
         .fetch_one(&store.pool)
         .await?;
     assert_eq!(count, 0);
-    f.manager.finish_task(42, 7, session.id, false).await?;
+    assert!(
+        f.manager
+            .finish_task(42, 7, session.id, false)
+            .await
+            .is_err()
+    );
+    issue_releases::verified_release(store, run.id).await?;
     // Lost Discord response does not record a second release or new cleanup intent.
     assert!(
         f.manager
@@ -330,7 +336,10 @@ async fn release_confirmation_and_cleanup_survive_crashes_without_releasing_twic
         sqlx::query_as("SELECT merge_sha,confirmed_by FROM issue_release_confirmations")
             .fetch_all(&store.pool)
             .await?;
-    assert_eq!(receipts, vec![("e".repeat(40), "42".into())]);
+    assert_eq!(
+        receipts,
+        vec![("e".repeat(40), "release-controller".into())]
+    );
     let error: Option<String> = sqlx::query_scalar("SELECT last_error FROM issue_runs WHERE id=$1")
         .bind(run.id)
         .fetch_one(&store.pool)
@@ -356,7 +365,8 @@ async fn release_confirmation_and_cleanup_survive_crashes_without_releasing_twic
         .queue_command("status", "release-crash", 42, 7, None)
         .await?;
     assert!(
-        status.contains("release confirmed by 42") && status.contains("issue cleanup: blocked")
+        status.contains("release confirmed by release-controller")
+            && status.contains("issue cleanup: blocked")
     );
     std::fs::remove_file(source.join("diagnostic"))?;
     let repo = store.repository("release-crash").await?;

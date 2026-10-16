@@ -188,7 +188,7 @@ impl Store {
             .bind(run).execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "Stale integration or issue validation");
         let reason = format!(
-            "Integrated validated issue as {merge}. Release is gated; no deployment was started. Complete the configured release verification before /complete."
+            "Integrated validated issue as {merge}. The release controller requires trusted configuration and independent revision health verification before completing this issue."
         );
         sqlx::query("UPDATE sessions SET status='idle',repository_claimed=false,last_outcome='completed',last_error=NULL,status_snapshot=jsonb_set(status_snapshot,'{activity}',to_jsonb($2::text)),updated_at=now() WHERE id=$1 AND status IN ('idle','integrating') AND current_turn_id IS NULL")
             .bind(session).bind(&reason).execute(&mut *tx).await?;

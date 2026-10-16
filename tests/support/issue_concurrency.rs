@@ -306,7 +306,8 @@ async fn integration_contention_waits_through_uncertainty_and_release_confirmati
         .await?;
     assert!(status.contains("waiting for integration/release: 1"));
     assert!(status.contains("Integration/release slot: #2 (releasing)"));
-    f.manager.finish_task(42, 7, sb.id, false).await?;
+    assert!(f.manager.finish_task(42, 7, sb.id, false).await.is_err());
+    issue_releases::verified_release(store, b.id).await?;
     assert!(
         store
             .try_begin_issue_integration(c, &policy, "/candidate-c")

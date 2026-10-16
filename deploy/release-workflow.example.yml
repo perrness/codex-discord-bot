@@ -1,0 +1,30 @@
+# Contract for an EXISTING trusted workflow, not an installable deployment.
+# Keep this file outside .github until an operator supplies and tests the jobs.
+name: Trusted issue release
+run-name: 'codex-release:${{ inputs.release_id }}:${{ inputs.revision }}'
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Exact integrated commit SHA
+        required: true
+        type: string
+      release_id:
+        description: Durable issue run UUID
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+jobs:
+  configure-before-use:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an operator-tested deployment implementation
+        run: |
+          echo 'Replace this job with the existing trusted build and deployment workflow.'
+          echo 'Build inputs.revision without production secrets; deploy its immutable artifact in a separate protected environment job.'
+          echo 'Wait for rollout completion. Never run deployment code from the issue revision with production credentials.'
+          exit 1

@@ -140,6 +140,13 @@ impl Manager {
                 }
                 .into())
             }
+            "release" => {
+                let number = issue.context("Supply an issue number")?;
+                let run: Uuid = sqlx::query_scalar("SELECT id FROM issue_runs WHERE repository_id=$1 AND issue_number=$2 ORDER BY attempt DESC LIMIT 1")
+                    .bind(repo.id).bind(number).fetch_one(&self.store.pool).await?;
+                self.store.request_issue_release(run).await?;
+                Ok("Release requested from the separate trusted controller. It requires configured workflow and health checks; see /queue status for the result.".into())
+            }
             "retry" => {
                 let number = issue.context("Supply an issue number")?;
                 let attempt: Run = sqlx::query_as("SELECT * FROM issue_runs WHERE repository_id=$1 AND issue_number=$2 ORDER BY attempt DESC LIMIT 1")
@@ -251,8 +258,52 @@ impl Manager {
                             "\n  release confirmed by {user} · {}",
                             render::truncate(&sha, 12)
                         ));
+                    }
+                    if let Some(release) = self.store.release(run.id).await? {
+                        let checks: Vec<crate::releases::HealthResult> =
+                            serde_json::from_value(release.health_results)?;
+                        for check in checks {
+                            if !check.healthy
+                                || check.revision.as_deref() != Some(&release.expected_sha)
+                                || check.error.is_some()
+                            {
+                                text.push_str(&format!(
+                                    "\n  health {}: healthy={} · revision={}{}",
+                                    render::truncate(&check.url, 120),
+                                    check.healthy,
+                                    check
+                                        .revision
+                                        .as_deref()
+                                        .map(|s| render::truncate(s, 40))
+                                        .unwrap_or_else(|| "unknown".into()),
+                                    check
+                                        .error
+                                        .map(|e| format!(" · {}", render::truncate(&e, 120)))
+                                        .unwrap_or_default()
+                                ));
+                            }
+                        }
+                        text.push_str(&format!(
+                            "\n  release: {} · expected {}{}{}",
+                            release.state,
+                            release.expected_sha,
+                            release
+                                .deployed_revision
+                                .map(|sha| format!(" · deployed {sha}"))
+                                .unwrap_or_default(),
+                            release
+                                .workflow_run_id
+                                .map(|id| format!(
+                                    " · https://github.com/{}/actions/runs/{id}",
+                                    release.github_repository
+                                ))
+                                .unwrap_or_default()
+                        ));
+                        if let Some(error) = release.last_error {
+                            text.push_str(&format!("\n  {}", render::truncate(&error, 200)));
+                        }
                     } else if run.state == "releasing" {
-                        text.push_str("\n  release: awaiting operator verification and /complete");
+                        text.push_str("\n  release: awaiting trusted workflow dispatch and revision health checks");
                     }
                     let cleanup: Vec<(String, String, Option<String>)> = sqlx::query_as("SELECT kind,state,last_error FROM issue_worktree_cleanup WHERE run_id=$1 ORDER BY kind")
                         .bind(run.id).fetch_all(&self.store.pool).await?;

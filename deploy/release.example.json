@@ -1,0 +1,19 @@
+{
+  "repositories": {
+    "project": {
+      "github_repository": "owner/project",
+      "workflow_id": 123456,
+      "workflow_ref": "release-controller-v1",
+      "workflow_sha": "REPLACE_WITH_40_CHARACTER_TRUSTED_WORKFLOW_COMMIT_SHA",
+      "deployment_timeout_seconds": 1800,
+      "health_timeout_seconds": 180,
+      "health_checks": [
+        {
+          "url": "https://app.example.com/health/revision",
+          "timeout_seconds": 10
+        }
+      ],
+      "disposable_test_run": "https://github.com/owner/project/actions/runs/REPLACE_WITH_SUCCESSFUL_DISPOSABLE_RUN_ID"
+    }
+  }
+}

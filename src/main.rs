@@ -27,7 +27,13 @@ async fn main() -> Result<()> {
         tracing::info!("Migrations complete");
         return Ok(());
     }
-    ensure!(mode == "run", "Usage: codex-discord-bot [run|migrate]");
+    if mode == "releases" {
+        return codex_discord_bot::releases::run_service().await;
+    }
+    ensure!(
+        mode == "run",
+        "Usage: codex-discord-bot [run|migrate|releases]"
+    );
     ensure!(
         !rustix::process::geteuid().is_root(),
         "Run the bot as a non-root service account"

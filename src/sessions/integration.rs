@@ -22,6 +22,7 @@ impl Manager {
                 // Read back ambiguous mutations immediately. Never repeat them.
                 if i.operation.is_some() {
                     if self.reconcile_integration(&i).await.is_ok() {
+                        self.request_live_release(i.run_id).await?;
                         return Ok(());
                     }
                     self.store
@@ -203,7 +204,8 @@ impl Manager {
             let pr = gh.pr(i.pr_number.context("Missing PR")?).await?;
             gh.identity(&pr, &i)?;
             if pr["merged"] == true {
-                return self.confirm_merge(&gh, &i, &pr).await;
+                self.confirm_merge(&gh, &i, &pr).await?;
+                return self.request_live_release(i.run_id).await;
             }
             ensure!(
                 pr["state"] == "open",
@@ -245,7 +247,8 @@ impl Manager {
         loop {
             let pr = gh.pr(i.pr_number.context("Missing PR")?).await?;
             if pr["merged"] == true {
-                return self.confirm_merge(&gh, &i, &pr).await;
+                self.confirm_merge(&gh, &i, &pr).await?;
+                return self.request_live_release(i.run_id).await;
             }
             gh.identity(&pr, &i)?;
             if let Some(request) = i.merge_request_id {
@@ -289,6 +292,23 @@ impl Manager {
         }
         let sha = gh.verify_merge(i, pr).await?;
         self.store.finish_integration(i.run_id, &sha).await
+    }
+
+    async fn request_live_release(&self, run: Uuid) -> Result<()> {
+        let integration = self
+            .store
+            .integration(run)
+            .await?
+            .context("Missing integration")?;
+        let policy: Policy = serde_json::from_value(integration.policy)?;
+        if integration.state == "merged" && self.store.release(run).await?.is_none() {
+            if policy.release_gate == crate::integration::ReleaseGate::DispatchOnly {
+                self.store.request_issue_release(run).await?;
+            } else {
+                self.store.block_release(run,"Deployments are disabled by the trusted integration gate. No unattended release was requested.",false).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Read-only GitHub reconciliation. Never restarts a check, turn or mutation.
@@ -362,6 +382,7 @@ impl Manager {
                 // the queue slot. Keep the evidence for the next read-only poll.
                 tracing::warn!(%run, %error, "Integration reconciliation deferred");
             }
+            self.request_live_release(i.run_id).await?;
         }
         Ok(())
     }

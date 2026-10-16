@@ -106,6 +106,19 @@ fn completed_dependency(value: &Value) -> Result<(String, i64)> {
 }
 
 impl GitHub {
+    #[cfg(test)]
+    pub(crate) fn test_client(repository: &str, executable: PathBuf) -> Result<Self> {
+        Ok(Self {
+            repository: GitHubRepository::parse(repository)?,
+            executable,
+        })
+    }
+    pub(crate) fn release_client(repository: &str) -> Result<Self> {
+        Ok(Self {
+            repository: GitHubRepository::parse(repository)?,
+            executable: "/usr/bin/gh".into(),
+        })
+    }
     pub fn new(repository: &str) -> Result<Self> {
         Ok(Self {
             repository: GitHubRepository::parse(repository)?,
@@ -365,7 +378,7 @@ fn verify_commit(i: &Integration, commit: &Value) -> Result<()> {
     Ok(())
 }
 
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     value
         .bytes()
         .map(|b| {

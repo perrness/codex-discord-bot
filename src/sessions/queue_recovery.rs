@@ -17,6 +17,7 @@ impl Manager {
     pub async fn recover_issue_queue(&self) -> Result<()> {
         self.store.reconcile_issues().await?;
         self.reconcile_integrations().await?;
+        self.store.recover_releases().await?;
         let runs: Vec<Run> = sqlx::query_as("SELECT * FROM issue_runs WHERE state NOT IN ('queued','released','cancelled','failed')")
             .fetch_all(&self.store.pool).await?;
         for run in runs {

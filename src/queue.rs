@@ -2,6 +2,7 @@
 //! operation may still have executed. Restart requires explicit operator review.
 mod integration;
 mod recovery;
+mod releases;
 mod validation;
 use crate::persistence::Store;
 use anyhow::{Result, ensure};
