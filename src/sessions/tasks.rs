@@ -112,12 +112,38 @@ impl Manager {
         }
         let state = if dismiss { "dismissed" } else { "completed" };
         let mut tx = self.store.pool.begin().await?;
-        sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,updated_at=now() WHERE session_id=$1")
-            .bind(id).bind(if dismiss { "cancelled" } else { "released" }).execute(&mut *tx).await?;
+        let issue: Option<crate::queue::Run> =
+            sqlx::query_as("SELECT * FROM issue_runs WHERE session_id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let is_issue = issue.is_some();
+        if let Some(run) = issue {
+            if !dismiss {
+                // The authorized operator confirms the exact integrated revision.
+                // Receipt, release state, cleanup intent and Discord completion
+                // commit together, including when the command response is lost.
+                let changed = sqlx::query("INSERT INTO issue_release_confirmations(run_id,github_repository,merge_sha,confirmed_by) SELECT r.id,r.github_repository,i.merge_sha,$2 FROM issue_runs r JOIN issue_integrations i ON i.run_id=r.id WHERE r.id=$1 AND r.state='releasing' AND r.id IN (SELECT id FROM integrated_issue_runs)")
+                    .bind(run.id).bind(user.to_string()).execute(&mut *tx).await?.rows_affected();
+                ensure!(
+                    changed == 1,
+                    "Release confirmation requires a verified integration awaiting release"
+                );
+                sqlx::query("INSERT INTO issue_worktree_cleanup(run_id,kind,path,branch,revision) SELECT r.id,'issue',r.worktree,r.branch,i.source_sha FROM issue_runs r JOIN issue_integrations i ON i.run_id=r.id WHERE r.id=$1 AND r.worktree IS NOT NULL AND r.branch IS NOT NULL AND i.source_sha IS NOT NULL UNION ALL SELECT run_id,'integration',worktree,branch,candidate_sha FROM issue_integrations WHERE run_id=$1 AND candidate_sha IS NOT NULL")
+                    .bind(run.id).execute(&mut *tx).await?;
+            }
+            sqlx::query("UPDATE issue_runs SET state=$2,validation_id=CASE WHEN $2='cancelled' THEN NULL ELSE validation_id END,last_error=CASE WHEN $2='released' THEN NULL ELSE last_error END,updated_at=now() WHERE id=$1")
+                .bind(run.id).bind(if dismiss { "cancelled" } else { "released" }).execute(&mut *tx).await?;
+        }
         sqlx::query("UPDATE sessions SET channel_state=$2,completed_at=now(),delete_after=now()+make_interval(secs => $3::double precision),updated_at=now() WHERE id=$1")
             .bind(id).bind(state).bind(self.config.channel_retention.as_secs_f64()).execute(&mut *tx).await?;
+        let next = if is_issue {
+            "Issue worktrees are preserved on failure; clean worktrees are eligible for cleanup after release confirmation."
+        } else {
+            "Reply before then to reopen it."
+        };
         persistence::enqueue(&mut tx, id, &format!("task-{state}:{id}:{}", session.status_revision),
-            &format!("Task **{state}**. This channel will move to COMPLETED and be deleted after {} hours. Reply before then to reopen it.", self.config.channel_retention.as_secs() / 3600), None).await?;
+            &format!("Task **{state}**. This channel will move to COMPLETED and be deleted after {} hours. {next}", self.config.channel_retention.as_secs() / 3600), None).await?;
         tx.commit().await?;
         Ok(format!(
             "Task {state}. Channel move and cleanup are scheduled."

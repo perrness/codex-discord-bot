@@ -69,8 +69,7 @@ async fn main() -> Result<()> {
         server.shutdown().await;
         return Err(error.context("Session recovery failed"));
     }
-    manager.reconcile_integrations().await?;
-    manager.store.reconcile_issues().await?;
+    manager.recover_issue_queue().await?;
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
     let mut discord = Client::builder(&config.discord_token, intents)

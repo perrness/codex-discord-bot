@@ -28,6 +28,9 @@ use uuid::Uuid;
 #[path = "support/discord.rs"]
 mod discord;
 
+#[path = "support/issue_recovery.rs"]
+mod issue_recovery;
+
 struct Mock {
     writer: Arc<AsyncMutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
     observed: Arc<Mutex<Vec<Value>>>,
@@ -1536,14 +1539,52 @@ async fn permission_rejection_keeps_diagnostics_and_reconnect_allows_only_explic
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn ambiguous_success_is_adopted_on_restart_without_duplicate_channels_or_task_replay()
 -> Result<()> {
+    check_ambiguous_channel_recovery(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn ambiguous_issue_channel_is_adopted_on_restart_without_task_replay() -> Result<()> {
+    check_ambiguous_channel_recovery(true).await
+}
+
+async fn check_ambiguous_channel_recovery(queued: bool) -> Result<()> {
     let api = discord::Api::start().await;
     let f = Fixture::with_http(api.http.clone()).await?;
     f.manager.prepare_discord().await?;
     f.manager.register_repository("ambiguous", true).await?;
+    let source = if queued {
+        let repo = f.manager.store.repository("ambiguous").await?;
+        let output = tokio::process::Command::new("git")
+            .current_dir(&repo.path)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial",
+            ])
+            .output()
+            .await?;
+        assert!(output.status.success());
+        sqlx::query("INSERT INTO issue_queues(repository_id,requester_id,guild_id,paused) VALUES($1,'42','7',false)")
+            .bind(repo.id).execute(&f.manager.store.pool).await?;
+        f.manager
+            .store
+            .enqueue_issue(repo.id, "owner/repo", 1)
+            .await?;
+        let run = f.manager.store.claim_issue(repo.id).await?.unwrap();
+        format!("issue:{}", run.id)
+    } else {
+        "ambiguous".into()
+    };
     api.state.lock().unwrap().fail_after_create = Some((502, 0));
     assert!(
         f.manager
-            .create_task(42, 7, "ambiguous", "ambiguous", "Task")
+            .create_task(42, 7, &source, "ambiguous", "Task")
             .await
             .is_err()
     );
@@ -1556,10 +1597,7 @@ async fn ambiguous_success_is_adopted_on_restart_without_duplicate_channels_or_t
         .bind(s.id)
         .execute(&f.manager.store.pool)
         .await?;
-    f.manager
-        .store
-        .receipt_state("ambiguous", "received")
-        .await?;
+    f.manager.store.receipt_state(&source, "received").await?;
     f.manager.recover().await?;
     f.manager.reconcile_channels().await?;
     f.manager.maintain_channels_once().await?;
@@ -1567,7 +1605,8 @@ async fn ambiguous_success_is_adopted_on_restart_without_duplicate_channels_or_t
     assert_eq!(adopted.channel_id(), Some("1001"));
     assert!(!adopted.repository_claimed && adopted.codex_thread_id.is_none());
     let receipt: String =
-        sqlx::query_scalar("SELECT state FROM inbound_requests WHERE discord_id='ambiguous'")
+        sqlx::query_scalar("SELECT state FROM inbound_requests WHERE discord_id=$1")
+            .bind(&source)
             .fetch_one(&f.manager.store.pool)
             .await?;
     assert_eq!(receipt, "rejected");
@@ -2129,6 +2168,7 @@ async fn failed_issue_worktree_allocation_is_persisted_and_never_replayed() -> R
             .fetch_one(&store.pool)
             .await?;
     assert_eq!(store.session(session).await?.working_directory, worktree);
+    assert_eq!(store.session(session).await?.channel_state, "missing");
     assert!(!branch.is_empty());
     f.manager.recover().await?;
     store.reconcile_issues().await?;

@@ -15,7 +15,8 @@ impl Manager {
                 .execute(&self.store.pool)
                 .await?;
             let result = self.recover_one(&s).await;
-            if result.is_err() {
+            if let Err(error) = result {
+                tracing::warn!(session = %s.id, %error, "Session recovery needs inspection");
                 // Keep the claim: lack of evidence must never authorize a second writer.
                 sqlx::query("UPDATE sessions SET status='unavailable',last_outcome='unknown',last_error='Recovery could not verify conversation or process state; inspect with SSH',updated_at=now() WHERE id=$1")
                     .bind(s.id).execute(&self.store.pool).await?;
@@ -32,7 +33,9 @@ impl Manager {
         let Some(thread) = &session.codex_thread_id else {
             // No turn can have been submitted without first persisting its Codex thread ID.
             let mut tx = self.store.pool.begin().await?;
-            sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,channel_state=CASE WHEN discord_channel_id IS NULL AND channel_state='provisioning' AND EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1) THEN 'missing' ELSE channel_state END,last_outcome='unknown',last_error='Setup was interrupted before task submission',updated_at=now() WHERE id=$1")
+            // Channel creation may have succeeded before the crash, including for queued issues.
+            // Preserve provisioning so channel reconciliation can adopt its durable marker.
+            sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,last_outcome='unknown',last_error='Setup was interrupted before task submission',updated_at=now() WHERE id=$1")
                 .bind(session.id).execute(&mut *tx).await?;
             sqlx::query("UPDATE inbound_requests SET state='rejected',updated_at=now() WHERE session_id=$1 AND state IN ('received','uncertain')")
                 .bind(session.id).execute(&mut *tx).await?;
@@ -98,8 +101,18 @@ impl Manager {
         let mut tx = self.store.pool.begin().await?;
         sqlx::query("UPDATE sessions SET status='idle',repository_claimed=false,current_turn_id=NULL,last_outcome=$2,last_error=NULL,updated_at=now() WHERE id=$1")
             .bind(session.id).bind(outcome).execute(&mut *tx).await?;
+        let queued: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1)")
+                .bind(session.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let next = if queued {
+            "Inspect /queue status for reconciliation and explicit retry instructions."
+        } else {
+            "Send a new message to continue."
+        };
         persistence::enqueue(&mut tx, session.id, &format!("recovered:{}:{}", self.generation, session.id),
-            &format!("Service restarted. Latest stored turn: **{outcome}**. Pending approvals expired. No task was replayed; send a new message to continue."), None).await?;
+            &format!("Service restarted. Latest stored turn: **{outcome}**. Pending approvals expired. No task was replayed. {next}"), None).await?;
         tx.commit().await?;
         self.drop_repository_lock(session);
         Ok(())

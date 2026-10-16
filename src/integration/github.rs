@@ -214,9 +214,18 @@ impl GitHub {
         self.api("GET", &format!("/pulls/{number}"), None).await
     }
 
+    pub async fn recovery_pr(&self, i: &Integration) -> Result<Option<Value>> {
+        match i.pr_number {
+            Some(number) => self.pr(number).await.map(Some),
+            None => self.find_pr(i).await,
+        }
+    }
+
     pub fn identity(&self, pr: &Value, i: &Integration) -> Result<()> {
         ensure!(
             pr["head"]["repo"]["full_name"].as_str() == Some(self.repository.as_str())
+                && i.pr_number
+                    .is_none_or(|number| pr["number"].as_i64() == Some(number))
                 && pr["base"]["repo"]["full_name"].as_str() == Some(self.repository.as_str())
                 && pr["head"]["ref"].as_str() == Some(i.branch.as_str())
                 && pr["head"]["sha"].as_str() == Some(i.candidate()?)
@@ -403,7 +412,7 @@ esac
         assert!(gh.merge(&i).await.is_err());
         // Restart/retry reconciliation only reads the durable PR identity.
         for _ in 0..2 {
-            let pr = gh.find_pr(&i).await.unwrap().unwrap();
+            let pr = gh.recovery_pr(&i).await.unwrap().unwrap();
             assert_eq!(gh.verify_merge(&i, &pr).await.unwrap(), "e".repeat(40));
         }
         let calls = std::fs::read_to_string(dir.path().join("requests")).unwrap();
@@ -414,6 +423,42 @@ esac
                 .unwrap();
         assert_eq!(body["sha"], i.candidate().unwrap());
         assert_eq!(body["bypass_rules"], false);
+    }
+
+    #[tokio::test]
+    async fn restart_observes_absent_open_closed_and_merged_prs_using_only_reads() {
+        let (dir, gh, mut i) = fixture();
+        i.pr_number = None;
+        for operation in ["push", "create_pr", "merge"] {
+            i.operation = Some(operation.into());
+            assert!(gh.recovery_pr(&i).await.unwrap().is_none());
+        }
+        std::fs::copy(
+            dir.path().join("created-list.json"),
+            dir.path().join("list.json"),
+        )
+        .unwrap();
+        let pr = gh.recovery_pr(&i).await.unwrap().unwrap();
+        gh.identity(&pr, &i).unwrap();
+        assert_eq!(pr["state"], "open");
+        i.pr_number = Some(7);
+        let mut closed = pr;
+        closed["state"] = "closed".into();
+        std::fs::write(dir.path().join("pr.json"), closed.to_string()).unwrap();
+        assert_eq!(gh.recovery_pr(&i).await.unwrap().unwrap()["merged"], false);
+        std::fs::copy(
+            dir.path().join("merged-pr.json"),
+            dir.path().join("pr.json"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let pr = gh.recovery_pr(&i).await.unwrap().unwrap();
+            assert_eq!(gh.verify_merge(&i, &pr).await.unwrap(), "e".repeat(40));
+        }
+        std::fs::remove_file(dir.path().join("pr.json")).unwrap();
+        assert!(gh.recovery_pr(&i).await.is_err());
+        let calls = std::fs::read_to_string(dir.path().join("requests")).unwrap();
+        assert!(calls.lines().all(|line| line.starts_with("GET ")));
     }
 
     #[tokio::test]

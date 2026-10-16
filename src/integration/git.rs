@@ -109,6 +109,8 @@ pub(crate) async fn candidate(
     Ok((sha, tree))
 }
 
+/// Assert the expected HEAD and clean status using only rev-parse and status.
+/// This never invokes `git clean`, resets files or removes any contents.
 pub(crate) async fn clean(path: &Path, expected: &str) -> Result<()> {
     ensure!(
         revision(path, "HEAD^{commit}").await? == expected,

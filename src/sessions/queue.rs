@@ -133,6 +133,17 @@ impl Manager {
             }
             "retry" => {
                 let number = issue.context("Supply an issue number")?;
+                let attempt: Run = sqlx::query_as("SELECT * FROM issue_runs WHERE repository_id=$1 AND issue_number=$2 ORDER BY attempt DESC LIMIT 1")
+                    .bind(repo.id).bind(number).fetch_one(&self.store.pool).await?;
+                ensure!(
+                    matches!(attempt.state.as_str(), "blocked" | "failed" | "cancelled"),
+                    "Only blocked, failed or cancelled issues can be retried"
+                );
+                let gate = attempt.session_id.map(|id| self.gate(id));
+                let _guard = match &gate {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
                 let latest: Option<crate::integration::Integration> = sqlx::query_as("SELECT i.* FROM issue_integrations i WHERE i.run_id=(SELECT id FROM issue_runs WHERE repository_id=$1 AND issue_number=$2 ORDER BY attempt DESC LIMIT 1)")
                     .bind(repo.id).bind(number).fetch_optional(&self.store.pool).await?;
                 if let Some(i) = latest {
@@ -187,6 +198,36 @@ impl Manager {
                             i.pr_url.map(|url| format!(" · {url}")).unwrap_or_default()
                         ));
                     }
+                    let (phase, worktree): (Option<String>, Option<String>) = sqlx::query_as(
+                        "SELECT recovery_phase,worktree_error FROM issue_runs WHERE id=$1",
+                    )
+                    .bind(run.id)
+                    .fetch_one(&self.store.pool)
+                    .await?;
+                    if let Some(phase) = phase {
+                        text.push_str(&format!("\n  restart phase: {phase}"));
+                    }
+                    if let Some(error) = worktree {
+                        text.push_str(&format!("\n  {}", render::truncate(&error, 200)));
+                    }
+                    let release: Option<(String, String)> = sqlx::query_as("SELECT merge_sha,confirmed_by FROM issue_release_confirmations WHERE run_id=$1")
+                        .bind(run.id).fetch_optional(&self.store.pool).await?;
+                    if let Some((sha, user)) = release {
+                        text.push_str(&format!(
+                            "\n  release confirmed by {user} · {}",
+                            render::truncate(&sha, 12)
+                        ));
+                    } else if run.state == "releasing" {
+                        text.push_str("\n  release: awaiting operator verification and /complete");
+                    }
+                    let cleanup: Vec<(String, String, Option<String>)> = sqlx::query_as("SELECT kind,state,last_error FROM issue_worktree_cleanup WHERE run_id=$1 ORDER BY kind")
+                        .bind(run.id).fetch_all(&self.store.pool).await?;
+                    for (kind, state, error) in cleanup {
+                        text.push_str(&format!("\n  {kind} cleanup: {state}"));
+                        if let Some(error) = error {
+                            text.push_str(&format!(" · {}", render::truncate(&error, 160)));
+                        }
+                    }
                 }
                 Ok(text)
             }
@@ -206,6 +247,7 @@ impl Manager {
             }
             if tokio::time::Instant::now() >= reconcile_at {
                 self.reconcile_uncertain_integrations().await?;
+                self.cleanup_completed_worktrees().await?;
                 reconcile_at = tokio::time::Instant::now() + Duration::from_secs(60);
             }
             // Closing a channel can cancel a run; only checked evidence permits release.
@@ -236,9 +278,7 @@ impl Manager {
                     .await;
                 if let Err(error) = result {
                     // Submission may have reached implementing before an uncertain RPC.
-                    sqlx::query("UPDATE issue_runs SET state='blocked',last_error=$3,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state IN ('preparing','implementing')")
-                        .bind(run.id).bind(run.claim_id).bind(format!("Dispatch needs review: {error:#}"))
-                        .execute(&self.store.pool).await?;
+                    self.store.block_issue_dispatch(&run, &format!("Dispatch needs review: {error:#}. Inspect /queue status; no submission will be replayed.")).await?;
                 }
             }
         }

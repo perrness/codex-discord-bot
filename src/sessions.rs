@@ -1,6 +1,7 @@
 mod integration;
 mod interactive;
 mod queue;
+mod queue_recovery;
 mod recovery;
 mod tasks;
 mod validation;
@@ -225,11 +226,13 @@ impl Manager {
             .await?;
         let gate = self.gate(session.id);
         let _guard = gate.lock().await;
+        let mut channel_setup_started = false;
         let result = async {
             self.take_repository_lock(&repo, session.id)?;
             self.prepare_issue_worktree(&repo, session.id).await?;
             let session = self.store.session(session.id).await?;
             self.validate_session_directory(&repo, &session).await?;
+            channel_setup_started = true;
             let channel = self.provision_channel(&session, name).await?;
             let current = self.store.session(session.id).await?;
             if let Err(error) = self.sync_status(&current).await {
@@ -261,8 +264,9 @@ impl Manager {
         if result.is_err() {
             let current = self.store.session(session.id).await?;
             if current.status == "provisioning" {
-                sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,channel_state=CASE WHEN discord_channel_id IS NULL AND channel_state='provisioning' THEN 'missing' ELSE channel_state END,last_error='Setup failed; no task was submitted',updated_at=now() WHERE id=$1")
-                    .bind(session.id).execute(&self.store.pool).await?;
+                // Only a failure before channel setup proves no Discord creation was attempted.
+                sqlx::query("UPDATE sessions SET status='unavailable',repository_claimed=false,channel_state=CASE WHEN $2 AND discord_channel_id IS NULL AND channel_state='provisioning' THEN 'missing' ELSE channel_state END,last_error='Setup failed; no task was submitted',updated_at=now() WHERE id=$1")
+                    .bind(session.id).bind(!channel_setup_started).execute(&self.store.pool).await?;
                 self.drop_repository_lock(&current);
                 self.store.receipt_state(source, "rejected").await?;
             }

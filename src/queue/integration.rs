@@ -143,7 +143,7 @@ impl Store {
         let changed = sqlx::query("UPDATE issue_integrations SET state='merged',merge_sha=$2,retry_safe=false,last_error=NULL,updated_at=now() WHERE run_id=$1 AND validated_at IS NOT NULL AND pr_number IS NOT NULL AND (merge_sha IS NULL OR merge_sha=$2)")
             .bind(run).bind(merge).execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "Incomplete integration evidence");
-        let changed = sqlx::query("UPDATE issue_runs SET state='releasing',last_error=NULL,updated_at=now() WHERE id=$1 AND state IN ('integrating','blocked','releasing') AND id IN (SELECT id FROM integrated_issue_runs)")
+        let changed = sqlx::query("UPDATE issue_runs SET state='releasing',last_error=NULL,updated_at=now() WHERE id=$1 AND state IN ('integrating','blocked','releasing','cancelled') AND id IN (SELECT id FROM integrated_issue_runs)")
             .bind(run).execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "Stale integration or issue validation");
         let reason = format!(

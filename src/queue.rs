@@ -1,6 +1,7 @@
 //! Durable dispatch. Claims are never recycled on a timer: an expired external
 //! operation may still have executed. Restart requires explicit operator review.
 mod integration;
+mod recovery;
 mod validation;
 use crate::persistence::Store;
 use anyhow::{Result, ensure};
@@ -97,21 +98,11 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         ensure!(from.permits(to), "Invalid issue state transition");
-        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs)) AND ($4 NOT IN ('releasing','released') OR id IN (SELECT id FROM integrated_issue_runs))")
+        let changed = sqlx::query("UPDATE issue_runs SET state=$4,last_error=$5,updated_at=now() WHERE id=$1 AND claim_id=$2 AND state=$3 AND ($4 NOT IN ('integrating','releasing','released') OR id IN (SELECT id FROM validated_issue_runs)) AND ($4 NOT IN ('releasing','released') OR id IN (SELECT id FROM integrated_issue_runs)) AND ($4 <> 'released' OR id IN (SELECT id FROM confirmed_issue_releases))")
             .bind(run.id).bind(run.claim_id).bind(from.as_str()).bind(to.as_str()).bind(error).execute(&self.pool).await?.rows_affected();
         ensure!(changed == 1, "Stale issue claim or state");
         Ok(())
     }
-    pub async fn reconcile_issues(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE issue_validations SET state='interrupted',error='Service restarted during validation; checks were not replayed',finished_at=now() WHERE state='running'")
-            .execute(&mut *tx).await?;
-        sqlx::query("UPDATE issue_runs SET state='blocked',validation_id=CASE WHEN EXISTS(SELECT 1 FROM issue_integrations i WHERE i.run_id=issue_runs.id) THEN validation_id ELSE NULL END,last_error='Service restarted; inspect the linked session before retry. No turn was replayed.',updated_at=now() WHERE state IN ('preparing','implementing','validating','integrating','releasing') AND id NOT IN (SELECT id FROM integrated_issue_runs)")
-            .execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     pub async fn require_issue_validation(&self, session: Uuid) -> Result<()> {
         let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_runs WHERE session_id=$1 AND (state NOT IN ('integrating','releasing') OR id NOT IN (SELECT id FROM validated_issue_runs)))")
             .bind(session).fetch_one(&self.pool).await?;
@@ -153,8 +144,13 @@ impl Store {
             .bind(old.id)
             .execute(&mut *tx)
             .await?;
+        let next = Uuid::new_v4();
         sqlx::query("INSERT INTO issue_runs(id,repository_id,github_repository,issue_number,attempt) VALUES($1,$2,$3,$4,$5)")
-            .bind(Uuid::new_v4()).bind(repo).bind(old.github_repository).bind(number).bind(old.attempt+1).execute(&mut *tx).await?;
+            .bind(next).bind(repo).bind(old.github_repository).bind(number).bind(old.attempt+1).execute(&mut *tx).await?;
+        if let Some(session) = old.session_id {
+            crate::persistence::enqueue(&mut tx, session, &format!("issue-retry:{next}"),
+                &format!("Issue #{number}: attempt {} queued as `{next}`. The previous worktrees are preserved. Dispatch follows the queue's pause setting.", old.attempt + 1), None).await?;
+        }
         tx.commit().await?;
         Ok(())
     }

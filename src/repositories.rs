@@ -10,6 +10,9 @@ use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
 use tokio::process::Command;
 
+mod cleanup;
+pub(crate) use cleanup::remove_completed_worktree;
+
 pub struct RepositoryRoot {
     path: PathBuf,
     directory: File,

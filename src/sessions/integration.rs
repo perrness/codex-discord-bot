@@ -286,10 +286,7 @@ impl Manager {
         }
         let policy: Policy = serde_json::from_value(i.policy.clone())?;
         let gh = GitHub::new(&policy.github_repository)?;
-        let pr = match i.pr_number {
-            Some(n) => Some(gh.pr(n).await?),
-            None => gh.find_pr(i).await?,
-        };
+        let pr = gh.recovery_pr(i).await?;
         if let Some(pr) = pr {
             self.remember_pr(&gh, i, &pr).await?;
             let current = self
@@ -313,7 +310,7 @@ impl Manager {
     }
 
     pub async fn reconcile_integrations(&self) -> Result<()> {
-        let integrations: Vec<Integration> = sqlx::query_as("SELECT i.* FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE i.state <> 'merged' AND r.state NOT IN ('released','cancelled')")
+        let integrations: Vec<Integration> = sqlx::query_as("SELECT i.* FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE i.state <> 'merged' AND r.state <> 'released' AND (r.state <> 'cancelled' OR NOT i.retry_safe OR i.merge_sha IS NOT NULL)")
             .fetch_all(&self.store.pool).await?;
         for i in integrations {
             if let Err(error) = self.reconcile_integration(&i).await {
@@ -331,7 +328,7 @@ impl Manager {
     }
 
     pub(super) async fn reconcile_uncertain_integrations(&self) -> Result<()> {
-        let pending: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT i.run_id,r.session_id FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE i.state='uncertain' AND r.state='blocked'")
+        let pending: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT i.run_id,r.session_id FROM issue_integrations i JOIN issue_runs r ON r.id=i.run_id WHERE i.state='uncertain' AND r.state IN ('blocked','cancelled')")
             .fetch_all(&self.store.pool).await?;
         for (run, session) in pending {
             let gate = self.gate(session);
