@@ -27,3 +27,25 @@ Git history is unavailable in this checkout, so commit conventions cannot be ver
 
 ## Security & Configuration
 Use `.env.example` as the configuration reference; environment files are not loaded automatically. Never commit credentials. Keep `STATE_DIR` and `CODEX_HOME` outside `REPOS_ROOT`. Preserve repository locking, approval correlation, and recovery without automatic task replay.
+
+## Cleanup After a Published Merge
+
+After the task's final changes are merged into `main`, pushed upstream, and all
+required checks/reviews and deployment verification are complete, remove its
+disposable build output and temporary test files. Verify fresh remote merge
+evidence; for squash/rebase merges, check the merged PR's exact final head and
+published merge commit instead of relying on ancestry alone.
+
+Use `cargo metadata --no-deps --format-version 1` to identify `target_directory`,
+including `CARGO_TARGET_DIR` overrides. Before cleaning it, confirm that no build,
+test, IDE, or other task uses it and that the running service's executable is
+installed outside it. Preserve the deployed executable, `STATE_DIR`, `CODEX_HOME`,
+credentials, database volumes, and recovery artifacts. Never clean a shared
+output directory on behalf of another task or delete data with volume pruning.
+
+Inspect tracked, untracked, and ignored files before removing clean, inactive,
+task-owned worktrees with `git worktree remove` from another checkout. Preserve
+user changes and secrets; never force-remove a worktree. Use normal Git safety
+checks for local branch deletion and report refused/uncertain cleanup. Capture
+required evidence before deleting test output and report free space with `df -h /`.
+Propose build-profile changes or scheduled cleanup separately.
